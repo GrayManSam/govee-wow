@@ -7,6 +7,14 @@ After=graphical-session.target network-online.target
 ExecStart=%h/.local/bin/govee-wow daemon
 Restart=always
 RestartSec=5
+# Stay out of the game's way: lowest practical CPU/IO priority, small CPU share under load.
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+MemoryHigh=150M
+MemoryMax=300M
+# SIGTERM -> the script stops the screen capture and restores the lights before exiting
+TimeoutStopSec=10
 
 [Install]
 WantedBy=graphical-session.target

@@ -69,7 +69,7 @@ def main():
 
     print("2. schedule")
     want = {**{h: "afterdark" for h in list(range(23, 24)) + list(range(0, 7))},
-            **{h: "daylight" for h in range(7, 18)}, 18: "standard", 19: "party", 20: "standard",
+            **{h: "daylight" for h in range(7, 19)}, 19: "party", 20: "standard",
             21: "standard", 22: "standard"}
     table = {h: at_hour(gw, conf, h) for h in range(24)}
     bad = [f"{h}:00 is {table[h][0]}, want {want[h]}" for h in range(24) if table[h][0] != want[h]]

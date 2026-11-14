@@ -3,6 +3,7 @@ __pycache__/
 *.bak*
 # never commit your local state
 config.json
-screencast-token
+screencast-token*
+portal-declined
 *.status
 WoWCombatLog*.txt

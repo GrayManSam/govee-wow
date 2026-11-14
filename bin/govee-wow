@@ -7,7 +7,9 @@
   govee-wow when always     whenever WoW / Battle.net runs
   govee-wow when never      off
   govee-wow palette NAME    auto (by zone) | club | velvet | midnight | neon
-  govee-wow level N         overall brightness 10-100 (default 100)
+  govee-wow level N         master brightness 10-100 (default 100), on top of the style caps
+  govee-wow max [STYLE N]   per-style brightness cap in % (what the lights may reach at most):
+                            daylight 60, party 55, standard 50, comfort 45, afterdark 2 (1-10)
   govee-wow style NAME      comfort | standard | party | afterdark | daylight
   (schedule in config.json: 23-7 afterdark, 7-18 daylight, 19-20 party, else standard)
   daylight = greens matched to the game's terrain: ceiling = sky/canopy, lamps = ground
@@ -38,6 +40,9 @@ The room is one canvas: lamp - ceiling ring - lamp. Everything is choreographed 
     zone change          -> palette wipe across the room
 Real-time data comes from the CouchLights addon (an 8-pixel strip in the top-left corner,
 read from the screen). Without it the combat log file is used (1-3 s late).
+Screen capture uses GNOME's own screencast API on the TV (no "share your screen" dialog),
+starts once the WoW window has been up a few seconds, runs at capture_fps (15), and falls back
+to the desktop portal (one dialog, then a saved token) if that API is unavailable.
 Flash safety: every style stays within WCAG 2.3.1 (<= 3 flashes/s); "comfort" also caps how
 fast any light may change brightness, so it cannot strobe at all.
 Tuning: ~/.config/govee-wow/config.json.
@@ -48,16 +53,22 @@ import json
 import math
 import os
 import random
+import signal
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 CONF_DIR = Path.home() / ".config/govee-wow"
 CONF = CONF_DIR / "config.json"
-TOKEN = CONF_DIR / "screencast-token"
+TOKEN = CONF_DIR / "screencast-token"     # portal fallback, service's token (app id "")
+TOKEN_MANUAL = CONF_DIR / "screencast-token-manual"   # runs from a terminal (other app id)
+PRESTATE = CONF_DIR / "prestate.json"  # the lights' state before the show (survives crashes)
+WATCHING = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "govee-wow.watching"
 STATUS = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "govee-wow.status"
 PROFILE = Path.home() / ".config/gameprofile/current"
+WOW_EXE = os.environ.get("GOVEE_WOW_EXE", "Wow.exe").lower().encode()   # tests use a dummy
 LOGS = Path(os.environ.get("WOW_DIR") or Path.home() / "Games/battlenet/drive_c/Program Files (x86)/World of Warcraft/_forever_") / "Logs"   # WOW_DIR = your _forever_ folder
 
 CONF_VERSION = 4
@@ -106,33 +117,44 @@ COLORS = {
 DAY_COLORS = {
     "red": "#00e040", "crimson": "#008a3a", "hotpink": "#7dff00", "magenta": "#00ffa0",
     "purple": "#00e0a0", "violet": "#00a080", "deepblue": "#007a50", "blue": "#00b3a0",
-    "gold": "#ffd000", "flash": "#e0ffc0", "ice": "#40ffd0", "amber": "#b8e000",
-    "hurt": "#ffa000", "sun": "#f0ff90",
+    "gold": "#ffc800", "flash": "#60ff30", "ice": "#00ffc0", "amber": "#a0f000",
+    "hurt": "#ff9000", "sun": "#c8ff10",
 }
 # Sun over the day (hour, OKLab tint): dewy teal morning -> bright lime noon -> golden late.
-SUN_ARC = [(7, "#30e0b0"), (10, "#60ff80"), (13, "#a8ff40"), (16, "#d0e030"), (18, "#e0c030")]
+SUN_ARC = [(7, "#00e0a0"), (10, "#30ff60"), (13, "#90ff10"), (16, "#c8e000"), (18, "#ffc000")]
 
 # Styles. "slew" = the most a light's brightness may change per second (full range = 1.0);
 # it is a hard limit applied last, so no effect can strobe faster than the style allows.
+# "vivid" (0-1) = how much of the white / gray part of every color is removed before sending
+# (1 = fully saturated LED colors). Brightness caps live in config "max_level" (MAX_LEVEL).
 STYLES = {
     "comfort":  {"flash": False, "max_flashes": 1, "speed": 0.55, "slew": 0.9, "fx": 0.5,
-                 "pulse": 0.35, "heartbeat": 0.45, "boss_hits": False, "screen_flashes": False},
+                 "pulse": 0.35, "heartbeat": 0.45, "boss_hits": False, "screen_flashes": False,
+                 "vivid": 0.7},
     "standard": {"flash": True, "max_flashes": 2, "speed": 0.85, "slew": 4.0, "fx": 0.8,
-                 "pulse": 0.7, "heartbeat": 0.7, "boss_hits": True, "screen_flashes": True},
+                 "pulse": 0.7, "heartbeat": 0.7, "boss_hits": True, "screen_flashes": True,
+                 "vivid": 0.7},
     "party":    {"flash": True, "max_flashes": 3, "speed": 1.0, "slew": 0.0, "fx": 1.0,
-                 "pulse": 1.0, "heartbeat": 1.0, "boss_hits": True, "screen_flashes": True},
+                 "pulse": 1.0, "heartbeat": 1.0, "boss_hits": True, "screen_flashes": True,
+                 "vivid": 0.6},
     # After dark: never above 2% (dimmer locked at "afterdark_level", default 2, max 10), only warm eye-friendly colors
     # (red / deep orange / amber, zero blue), no flashes, very slow and gentle.
     "afterdark": {"flash": False, "max_flashes": 0, "speed": 0.4, "slew": 0.5, "fx": 0.4,
                   "pulse": 0.2, "heartbeat": 0.3, "boss_hits": False, "screen_flashes": False,
-                  "max_level": 2, "warm": True},
+                  "warm": True},
     # Daylight (7-18): the standard show recolored green; at rest the room becomes the game's
     # world - ceiling = sky / canopy overhead, lamps = ground rising into foliage behind you,
     # wind waves crossing left -> right, sun dapples drifting across the ceiling.
     "daylight": {"flash": True, "max_flashes": 2, "speed": 0.85, "slew": 2.2, "fx": 0.8,
                  "pulse": 0.7, "heartbeat": 0.7, "boss_hits": True, "screen_flashes": True,
-                 "green": True, "lift": 1.45},   # daytime: base looks run near 100%
+                 "green": True, "lift": 1.2, "lift_max": 0.85, "vivid": 0.9},
+    # lift raises the calm base looks a little but never above lift_max of the cap, so cues
+    # keep headroom instead of clipping into white (the old 1.45 lift pinned everything at 100%)
 }
+# Brightness cap per style (% of the lights' maximum, = the Govee dimmer). Nothing the show
+# sends - base looks, flashes, cues, the ceiling stream, lamp segments - can go above it:
+# colors are 0-1 *of the cap*. Daytime is the brightest (user: 100% hurt, 60% max).
+MAX_LEVEL = {"daylight": 60, "party": 55, "standard": 50, "comfort": 45, "afterdark": 2}
 
 
 def style_name(conf):
@@ -154,12 +176,14 @@ def style_name(conf):
     return conf.get("style") if conf.get("style") in STYLES else "comfort"
 
 
-def level_cap(conf):
-    """Govee dimmer % for this session: after dark uses its own tiny level (1-10)."""
-    st = STYLES[style_name(conf)]
-    if st.get("warm"):
-        return max(1, min(10, int(conf.get("afterdark_level", st["max_level"]))))
-    return min(conf["level"], st.get("max_level", 100))
+def level_cap(conf, name=None):
+    """Brightness cap % for a style (default: the one in effect now). After dark uses its own
+    tiny level (1-10); the others their "max_level" entry, never above the master "level"."""
+    name = name or style_name(conf)
+    if STYLES[name].get("warm"):
+        return max(1, min(10, int(conf.get("afterdark_level", MAX_LEVEL["afterdark"]))))
+    cap = (conf.get("max_level") or {}).get(name, MAX_LEVEL.get(name, 50))
+    return max(1, min(100, int(min(conf["level"], cap))))
 
 
 def warm(c):
@@ -177,11 +201,13 @@ DEFAULTS = {
     "night_style": "",
     "afterdark_level": 2,         # after-dark dimmer % (1-10)
     # Style by time of day: [from_hour, to_hour, style]; hours not listed use schedule_default.
-    "schedule": [[23, 7, "afterdark"], [7, 18, "daylight"], [19, 20, "party"]],
+    "schedule": [[23, 7, "afterdark"], [7, 19, "daylight"], [19, 20, "party"]],
     "terrain_tint": 0.55,         # daylight: how much the game's terrain colors drive the room
     "schedule_default": "standard",            # e.g. "afterdark": used automatically night_from..night_to
     "palette": "auto",
-    "level": 100,                 # overall brightness % (Govee dimmer is set to this)
+    "level": 100,                 # master brightness %, on top of the per-style caps
+    "max_level": dict(MAX_LEVEL),  # brightness cap per style in % (govee-wow max STYLE N);
+                                   # afterdark's is "afterdark_level"
     "night_scale": 1.0,           # e.g. 0.7 = 30% dimmer between night_from and night_to
     "night_from": 23, "night_to": 7,
     # base brightness of each program (0-1, on top of "level")
@@ -192,13 +218,20 @@ DEFAULTS = {
     "low_health": 0.35,           # heartbeat below this health
     "max_flashes_per_s": 3,       # photosensitivity guard for full-room flashes
     "screen": True,               # read the CouchLights strip + picture from the screen
+    "capture": "auto",            # auto = GNOME Mutter (no dialog), portal if that fails;
+                                  # "mutter" / "portal" force one
+    "capture_monitor": "auto",    # auto = the TV (EDID >= 100 cm or "TV" in name), else the
+                                  # primary; or a connector name such as "DP-3"
+    "capture_fps": 15,            # GNOME copies each 4K frame out of the GPU: keep this low
+                                  # (CouchLights holds each event 0.12 s, so >= 9 is safe)
+    "capture_delay": 5,           # seconds the WoW window must be up before capture starts
     "screen_tint": 0.25,          # how much the game picture tints the explore palette
     "screen_flashes": True,       # sudden bright frames (explosions, lightning) flash the room
     "room": [],                   # device IPs left -> right; empty = lamp, ceiling, lamp
     "lamp_segments": 15, "lamp_bottom_first": True, "lamp_hz": 12,
     "ceiling_pixels": 12, "stream_hz": 30,
-    "hunter_cooldowns": ["Bestial Wrath", "Trueshot", "Coordinated Assault",
-                         "Aspect of the Wild", "Call of the Wild", "Rapid Fire"],
+    "hunter_cooldowns": ["Rapid Fire", "Bestial Wrath", "Aspect of the Hawk", "Intimidation",
+                         "Aimed Shot"],     # WoW Forever = vanilla-era hunter
 }
 MINE, HOSTILE, T_PLAYER, T_PET, T_GUARDIAN = 0x1, 0x40, 0x400, 0x1000, 0x2000
 DAMAGE = ("SWING_DAMAGE", "RANGE_DAMAGE", "SPELL_DAMAGE", "SPELL_PERIODIC_DAMAGE")
@@ -227,6 +260,11 @@ def save_key(key, value):
     conf = json.loads(CONF.read_text()) if CONF.exists() else json.loads(json.dumps(DEFAULTS))
     conf[key] = value
     CONF.write_text(json.dumps(conf, indent=2) + "\n")
+
+
+def note(msg):
+    """One line to stdout (= the journal under systemd): session start / stop / restore."""
+    print(time.strftime("%H:%M:%S ") + msg, flush=True)
 
 
 # ---- color ---------------------------------------------------------------------------
@@ -273,6 +311,34 @@ def mix_lch(a, b, t):
     return (a[0] + (b[0] - a[0]) * t, c * math.cos(h), c * math.sin(h))
 
 
+def mix_hue(a, b, t):
+    """Like mix_lch, but keeps a's chroma (or more): tinting toward a dull game color turns the
+    hue without washing the color out."""
+    ca, cb = math.hypot(a[1], a[2]), math.hypot(b[1], b[2])
+    ha, hb = math.atan2(a[2], a[1]), math.atan2(b[2], b[1])
+    dh = (hb - ha + math.pi) % (2 * math.pi) - math.pi
+    h, c = ha + dh * t, max(ca, cb)
+    return (a[0] + (b[0] - a[0]) * t, c * math.cos(h), c * math.sin(h))
+
+
+def vivid(c, k):
+    """Remove k (0-1) of the white in an RGB color, keeping its brightest channel: pastel ->
+    saturated LED color of the same strength."""
+    mx, mn = max(c), min(c)
+    if k <= 0 or mx <= 0 or mn <= 0:
+        return c
+    d = mx - k * mn
+    return tuple(mx * (x - k * mn) / d for x in c)
+
+
+def fit(c):
+    """Out-of-range colors are scaled down as a whole (hue and saturation kept) instead of
+    clipping each channel, which turns stacked colors into white / yellow."""
+    c = tuple(max(0.0, x) for x in c)
+    m = max(c)
+    return scale(c, 1 / m) if m > 1 else c
+
+
 def mix(a, b, t):
     return tuple(x + (y - x) * t for x, y in zip(a, b))
 
@@ -293,7 +359,7 @@ def frac(x):
 GREEN_HUE = (math.radians(112), math.radians(188))     # OKLab hue: yellow-green .. teal
 
 
-def greenify(lab, lmin=0.55, lmax=0.86, cmin=0.11):
+def greenify(lab, lmin=0.55, lmax=0.80, cmin=0.17):
     """Any scene color -> the nearest green: hue clamped into lime..teal, never gray or dim.
     Mossy/olive terrain stays mossy, water stays teal, brown earth becomes yellow-green."""
     L, a, b = lab
@@ -340,7 +406,7 @@ class Palette:
 
     def tinted(self, lab, w):
         out = Palette([])
-        out.labs = [mix_lch(p, lab, w) for p in self.labs]
+        out.labs = [mix_hue(p, lab, w) for p in self.labs]
         return out
 
 
@@ -373,6 +439,15 @@ def razer(payload):
     return base64.b64encode(bytes(b)).decode()
 
 
+def kelvin_rgb(k):
+    """Color temperature -> RGB 0-255 (Tanner Helland's fit), for lights without white LEDs."""
+    t = k / 100
+    r = 255 if t <= 66 else 329.7 * (t - 60) ** -0.1332
+    g = 99.47 * math.log(t) - 161.12 if t <= 66 else 288.12 * (t - 60) ** -0.0755
+    b = 255 if t >= 66 else 0 if t <= 19 else 138.52 * math.log(t - 10) - 305.04
+    return {k2: int(max(0, min(255, v))) for k2, v in zip("rgb", (r, g, b))}
+
+
 def ptreal_segment(rgb, mask):
     b = [0x33, 0x05, 0x15, 0x01, *rgb, 0, 0, 0, 0, 0, mask & 0xFF, (mask >> 8) & 0xFF]
     b += [0] * (19 - len(b))
@@ -380,6 +455,7 @@ def ptreal_segment(rgb, mask):
 
 
 class Lights:
+    CALM = {"onOff": 1, "brightness": 40, "colorTemInKelvin": 2700}   # unknown "before"
     STREAM_SKUS = {"H1370"}                  # live per-pixel stream ("razer")
     SEGMENT_SKUS = {"H6076"}                 # per-segment colors ("ptReal")
 
@@ -395,6 +471,14 @@ class Lights:
         self.sent = {}
         self.last_lamp = 0.0
         self.streaming = False
+        # Brightness: `level` = what the lights show at most right now (%, ramps smoothly to
+        # `target`); `hw` = the highest the Govee dimmer may be at per device (an upper bound
+        # until a devStatus reply confirms it). Colors are sent scaled by level / hw, so no
+        # path - flashes, cues, the ceiling stream, lamp segments - can pass the cap, even if
+        # a brightness command was dropped or someone turned the dimmer up in the Govee app.
+        self.level, self.target, self.rate = 0.0, 0, 1.0
+        self.hw, self.want, self.resend = {}, {}, {}
+        self.last_tick = self.last_poll = self.last_cmd = 0.0
 
     def close(self):
         self.rx.close()
@@ -406,9 +490,9 @@ class Lights:
         except OSError:
             pass
 
-    def _drain(self, seconds, want):
+    def _drain(self, seconds, want, ips=None):
         out, end = {}, time.time() + seconds
-        while time.time() < end:
+        while time.time() < end and not (ips and all(ip in out for ip in ips)):
             try:
                 raw, addr = self.rx.recvfrom(4096)
                 msg = json.loads(raw)["msg"]
@@ -429,16 +513,50 @@ class Lights:
                 self.devices[ip] = d.get("sku", "?")
         return self.devices
 
-    def begin(self, level):
-        for ip in self.devices:
+    def status(self, seconds=1.0, ips=None):
+        for ip in ips or self.devices:
             self.send(ip, "devStatus", {})
-        self.saved = self._drain(1.5, "devStatus")
-        # Dimmer set ONCE; all motion is in the colors. Govee drops back-to-back commands.
+        return self._drain(seconds, "devStatus", list(ips or self.devices))
+
+    @staticmethod
+    def leftover(s):
+        """A saved "before" state that is really a frame of an earlier show (fully saturated
+        RGB, no white): restoring it would leave the show's colors on after WoW."""
+        c = s.get("color") or {}
+        rgb = [c.get(k, 255) for k in "rgb"]
+        return (not s.get("colorTemInKelvin") and max(rgb) > 0
+                and min(rgb) <= 0.12 * max(rgb))
+
+    def begin(self, level):
+        level = int(max(1, min(100, level)))
+        self.saved = self.status(1.5)
+        for ip, s in list(self.saved.items()):
+            if s.get("onOff", 1) and self.leftover(s):
+                note(f"{ip}: state before the show looks like an old show frame "
+                     f"({s.get('color')}, {s.get('brightness')}%): will restore calm warm white")
+                self.saved[ip] = dict(self.CALM)
+        try:                                 # last session never restored (crash / power cut):
+            old = json.loads(PRESTATE.read_text())   # its saved state is the real "before"
+            self.saved = {ip: old.get(ip) or self.saved.get(ip) for ip in self.devices
+                          if old.get(ip) or self.saved.get(ip)}
+            note("previous session did not finish: restoring to the state saved before it")
+        except (OSError, ValueError):
+            try:
+                PRESTATE.write_text(json.dumps(self.saved))
+            except OSError:
+                pass
+        # Dimmer = the cap, set before the lights turn on; all motion is in the colors.
+        # Govee drops back-to-back commands, hence the gaps.
         for ip in self.devices:
+            self.send(ip, "brightness", {"value": level})
+            time.sleep(0.2)
             self.send(ip, "turn", {"value": 1})
             time.sleep(0.2)
-            self.send(ip, "brightness", {"value": int(max(1, min(100, level)))})
-            time.sleep(0.2)
+            self.send(ip, "brightness", {"value": level})
+            time.sleep(0.15)
+            self.hw[ip] = max(level, int(self.saved.get(ip, {}).get("brightness", 100) or 100))
+            self.want[ip] = level
+        self.confirm(level, tries=2)
         for _ in range(2):
             for ip, sku in self.devices.items():
                 if sku in self.STREAM_SKUS:
@@ -446,37 +564,160 @@ class Lights:
             time.sleep(0.3)
         self.streaming = True
         self.sent = {}
+        self.level, self.last_tick = 0.0, time.time()       # fade in from dark
+        self.set_level(level, secs=3.0)
+        note(f"lights on: {', '.join(f'{ip} {s}' for ip, s in self.devices.items())}, "
+            f"cap {level}%")
+
+    def confirm(self, level, tries=2):
+        """Ask the lights for their dimmer; resend where it isn't `level` yet."""
+        for _ in range(tries):
+            for ip, d in self.status(0.8).items():
+                b = d.get("brightness")
+                if isinstance(b, (int, float)) and ip in self.devices:
+                    self.hw[ip] = int(b)
+            todo = [ip for ip in self.devices if self.hw.get(ip) != level]
+            if not todo:
+                return True
+            for ip in todo:
+                self.send(ip, "brightness", {"value": level})
+                time.sleep(0.2)
+        return False
+
+    def set_level(self, target, secs=4.0):
+        """New brightness cap: glide there over `secs` (never a jump)."""
+        target = int(max(1, min(100, target)))
+        if target == self.target:
+            return
+        self.target = target
+        self.rate = max(2.0, abs(target - self.level) / secs)
+        if target > self.level:              # going up: dimmer first, colors compensate
+            for ip in self.devices:
+                if self.want.get(ip, 0) < target:
+                    self.send(ip, "brightness", {"value": target})
+                    self.want[ip], self.resend[ip] = target, 2
+                    self.hw[ip] = max(self.hw.get(ip, 100), target)
+                    time.sleep(0.15)
+
+    def tick(self, now):
+        dt = max(0.0, min(0.5, now - self.last_tick))
+        self.last_tick = now
+        d = self.target - self.level
+        self.level += max(-self.rate * dt, min(self.rate * dt, d))
+        if abs(self.target - self.level) < 1e-6:          # arrived: dimmer down to the cap
+            for ip in self.devices:
+                if self.want.get(ip) != self.target and now - self.last_cmd > 0.25:
+                    self.send(ip, "brightness", {"value": self.target})
+                    self.want[ip], self.last_cmd = self.target, now
+                    self.hw[ip], self.resend[ip] = self.target, 2   # sent 3x: Govee drops some
+        for ip, n in self.resend.items():
+            if n > 0 and now - self.last_cmd > 0.35:
+                self.send(ip, "brightness", {"value": self.want[ip]})
+                self.resend[ip], self.last_cmd = n - 1, now
+        # unconfirmed dimmer: ask (non-blocking) and fix it; the colors stay scaled meanwhile
+        if now - self.last_poll > 3.0 and any(self.hw.get(ip) != self.want.get(ip)
+                                               for ip in self.devices):
+            self.last_poll = now
+            for ip in self.devices:
+                if self.hw.get(ip) != self.want.get(ip):
+                    self.send(ip, "devStatus", {})
+        self.rx.settimeout(0.0)
+        try:
+            while True:
+                try:
+                    raw, addr = self.rx.recvfrom(4096)
+                    msg = json.loads(raw)["msg"]
+                except (BlockingIOError, socket.timeout):
+                    break
+                except (ValueError, KeyError, OSError):
+                    continue
+                ip, b = addr[0], msg.get("data", {}).get("brightness")
+                if msg.get("cmd") == "devStatus" and ip in self.devices \
+                        and isinstance(b, (int, float)):
+                    self.hw[ip] = int(b)
+                    if int(b) != self.want.get(ip) and now - self.last_cmd > 0.25:
+                        self.send(ip, "brightness", {"value": self.want[ip]})
+                        self.last_cmd = now
+        finally:
+            self.rx.settimeout(0.3)
+
+    def gain(self, ip):
+        hw = self.hw.get(ip, 100) or 100
+        return min(1.0, self.level / hw)
+
+    def fade_out(self, secs=1.0):
+        """Show off: glide to dark (the stream keeps running meanwhile)."""
+        self.target, self.rate = 0, max(2.0, self.level / secs)
+        self.want = {ip: 0 for ip in self.devices}      # keep the dimmer where it is
 
     def end(self):
         if not self.streaming:
             return
-        for ip, sku in self.devices.items():
-            if sku in self.STREAM_SKUS:
-                self.send(ip, "razer", {"pt": razer([0xBB, 0, 1, 0xB1, 0])})
-        time.sleep(0.6)                      # devices ignore commands right after stream mode
-        for ip, s in self.saved.items():
-            if s.get("colorTemInKelvin"):
-                self.send(ip, "colorwc", {"color": {"r": 0, "g": 0, "b": 0},
-                                          "colorTemInKelvin": s["colorTemInKelvin"]})
-            else:
-                self.send(ip, "colorwc", {"color": s.get("color", {"r": 255, "g": 255, "b": 255}),
-                                          "colorTemInKelvin": 0})
-            time.sleep(0.2)
-            self.send(ip, "brightness", {"value": s.get("brightness", 100)})
-            if not s.get("onOff", 1):
+        for _ in range(3):                   # one lost packet left the ceiling in stream mode
+            for ip, sku in self.devices.items():
+                if sku in self.STREAM_SKUS:
+                    self.send(ip, "razer", {"pt": razer([0xBB, 0, 1, 0xB1, 0])})
+            time.sleep(0.15)
+        # The H1370 ignores every color command after stream mode until it is power-cycled
+        # (verified 2026-11-14) - without this the ceiling kept the show's last frame.
+        cycle = [ip for ip, sku in self.devices.items() if sku in self.STREAM_SKUS]
+        for ip in cycle:
+            self.send(ip, "turn", {"value": 0})
+        if cycle:
+            time.sleep(0.8)
+            for ip in cycle:
+                self.send(ip, "turn", {"value": 1})
+            time.sleep(0.8)
+        else:
+            time.sleep(0.6)                  # devices ignore commands right after stream mode
+        todo = {}
+        for ip in self.devices:
+            s = self.saved.get(ip)
+            todo[ip] = s if s and not (s.get("onOff", 1) and self.leftover(s)) else dict(self.CALM)
+        for attempt in range(3):
+            for ip, s in todo.items():
+                if s.get("colorTemInKelvin") and self.devices.get(ip) in self.STREAM_SKUS:
+                    self.send(ip, "colorwc", {"color": kelvin_rgb(s["colorTemInKelvin"]),
+                                              "colorTemInKelvin": 0})
+                elif s.get("colorTemInKelvin"):
+                    self.send(ip, "colorwc", {"color": {"r": 0, "g": 0, "b": 0},
+                                              "colorTemInKelvin": s["colorTemInKelvin"]})
+                else:
+                    self.send(ip, "colorwc", {"color": s.get("color", {"r": 255, "g": 255,
+                                                                       "b": 255}),
+                                              "colorTemInKelvin": 0})
                 time.sleep(0.2)
-                self.send(ip, "turn", {"value": 0})
+                self.send(ip, "brightness", {"value": s.get("brightness", 40)})
+                time.sleep(0.2)
+                if not s.get("onOff", 1):
+                    self.send(ip, "turn", {"value": 0})
+                    time.sleep(0.2)
+            got = self.status(1.2, list(todo))
+            ok = [ip for ip, s in todo.items() if ip in got
+                  and got[ip].get("onOff", 1) == s.get("onOff", 1)
+                  and (not s.get("onOff", 1) or got[ip].get("brightness") == s.get("brightness"))]
+            for ip in ok:
+                todo.pop(ip)
+            if not todo:
+                break
+        note("lights restored" + (f" (unconfirmed: {', '.join(todo)})" if todo else ""))
+        try:
+            PRESTATE.unlink()
+        except OSError:
+            pass
         self.streaming = False
 
     def show(self, frame, conf, now):
-        """frame: ip -> list of (r, g, b) floats 0-1 (lamps bottom -> top)."""
+        """frame: ip -> list of (r, g, b) floats 0-1 of the cap (lamps bottom -> top)."""
+        self.tick(now)
         for ip, cols in frame.items():
             if self.devices.get(ip) in self.STREAM_SKUS:
                 n = len(cols)
                 ln = 2 + 3 * n
                 pkt = [0xBB, ln >> 8, ln & 0xFF, 0xB0, 1, n]
+                g = self.gain(ip)
                 for c in cols:
-                    pkt += [int(round(max(0.0, min(1.0, x)) * 255)) for x in c]
+                    pkt += [int(round(max(0.0, min(1.0, x)) * g * 255)) for x in c]
                 self.send(ip, "razer", {"pt": razer(pkt)})
         if now - self.last_lamp < 1.0 / conf["lamp_hz"]:
             return
@@ -488,8 +729,9 @@ class Lights:
                 cols = cols[::-1]
             prev = self.sent.setdefault(ip, [None] * len(cols))
             batch = []
+            g = self.gain(ip)
             for i, c in enumerate(cols):
-                rgb = tuple(int(round(max(0.0, min(1.0, x)) * 255)) for x in c)
+                rgb = tuple(int(round(max(0.0, min(1.0, x)) * g * 255)) for x in c)
                 if prev[i] is not None and max(abs(a - b) for a, b in zip(rgb, prev[i])) < 4:
                     continue
                 batch.append(ptreal_segment(rgb, 1 << i))
@@ -531,15 +773,83 @@ def build_room(devices, conf):
 
 # ---- screen: GNOME portal + PipeWire (picture + CouchLights strip) ----------------------
 class Screen:
+    """Screen capture of the TV for the picture colors + the CouchLights strip.
+
+    Backends, tried in order (config "capture"):
+      mutter  org.gnome.Mutter.ScreenCast.RecordMonitor(connector): GNOME's own API, no
+              "share your screen" dialog for the local session, and it picks the TV itself.
+      portal  xdg-desktop-portal ScreenCast: a dialog the first time, then a persistent restore
+              token. The portal ties a token to the caller's app id, which comes from the
+              systemd unit: the service is "" but a terminal run is e.g. VS Code, so they keep
+              separate token files (sharing one made each run reject the other's -> dialog).
+    Cost: GNOME reads every captured frame back from the GPU at full size (4K = 33 MB), so
+    the stream is capped at capture_fps by PipeWire (max-framerate), not dropped afterwards,
+    and scaled with nearest-neighbour (touches only the sampled pixels)."""
     W, H = 96, 54            # downscaled picture for colors / flashes
     CW, CH = 200, 80         # unscaled top-left crop where the CouchLights strip lives
+    MUTTER = "org.gnome.Mutter.ScreenCast"
+    PORTAL = ("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop")
 
     def __init__(self):
         self.pipeline = self.sink = self.bridge = self.crop = None
         self.error = None
         self.cropped = False
+        self.backend = None
+        self.connector = None
+        self.closed = False      # GNOME ended the stream (monitors changed, sharing stopped)
+        self._bus = self._session = self._subs = self._ctx = self._fd = None
 
-    def start(self):
+    # -- monitors -----------------------------------------------------------------------
+    @staticmethod
+    def _edid_cm(connector):
+        for d in Path("/sys/class/drm").glob(f"card*-{connector}"):
+            try:
+                e = (d / "edid").read_bytes()
+                if len(e) >= 22:
+                    return e[21]
+            except OSError:
+                pass
+        return 0
+
+    def monitors(self):
+        """[(connector, display name, is_builtin, is_primary, width_cm)] of active monitors."""
+        from gi.repository import Gio
+        bus = self._bus or Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        r = bus.call_sync("org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+                          "org.gnome.Mutter.DisplayConfig", "GetCurrentState", None, None,
+                          Gio.DBusCallFlags.NONE, 3000, None).unpack()
+        _serial, mons, logical, _props = r
+        primary, active = set(), set()
+        for lm in logical:
+            for spec in lm[5]:
+                active.add(spec[0])
+                if lm[4]:
+                    primary.add(spec[0])
+        out = []
+        for spec, _modes, props in mons:
+            c = spec[0]
+            if c in active:
+                out.append((c, props.get("display-name", spec[2]), bool(props.get("is-builtin")),
+                            c in primary, self._edid_cm(c)))
+        return out
+
+    def pick_monitor(self, conf):
+        want = conf.get("capture_monitor", "auto")
+        mons = self.monitors()
+        if want != "auto":
+            return want if any(m[0] == want for m in mons) else None
+        tv = [m for m in mons if m[4] >= 100 or "TV" in m[1]]
+        for group in (tv, [m for m in mons if m[3]], mons):
+            if group:
+                return group[0][0]
+        return None
+
+    @staticmethod
+    def setup_signature(mons):
+        return ",".join(sorted(f"{m[0]}:{m[1]}" for m in mons))
+
+    # -- start ----------------------------------------------------------------------------
+    def start(self, conf):
         try:
             import gi
             gi.require_version("Gst", "1.0")
@@ -548,11 +858,95 @@ class Screen:
             self.error = f"GStreamer not available: {e}"
             return False
         Gst.init(None)
-        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self._Gst, self._GLib, self._Gio = Gst, GLib, Gio
+        self._bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self._ctx = GLib.MainContext.default()
+        self._subs = []
+        self.closed = False
+        mode = conf.get("capture", "auto")
+        errors = []
+        if mode in ("auto", "mutter"):
+            try:
+                if self._start_mutter(conf):
+                    return True
+            except GLib.Error as e:
+                errors.append(f"mutter: {e.message}")
+            self._close_session()
+            if self.error:
+                errors.append(self.error)
+        if mode in ("auto", "portal"):
+            try:
+                if self._start_portal(conf):
+                    return True
+            except GLib.Error as e:
+                errors.append(f"portal: {e.message}")
+            self._close_session()
+            if self.error:
+                errors.append(self.error)
+        self.error = "; ".join(dict.fromkeys(errors)) or "screen capture off"
+        return False
+
+    def _call(self, dest, path, iface, method, params, timeout=5000):
+        return self._bus.call_sync(dest, path, iface, method, params, None,
+                                   self._Gio.DBusCallFlags.NONE, timeout, None)
+
+    def _start_mutter(self, conf):
+        GLib, M = self._GLib, self.MUTTER
+        self.error = None
+        conn = self.pick_monitor(conf)
+        if not conn:
+            self.error = "mutter: no monitor to capture"
+            return False
+        sp = self._call(M, "/org/gnome/Mutter/ScreenCast", M, "CreateSession",
+                        GLib.Variant("(a{sv})", ({},))).unpack()[0]
+        self._session = ("mutter", sp)
+        self._subs.append(self._bus.signal_subscribe(
+            M, M + ".Session", "Closed", sp, None, self._Gio.DBusSignalFlags.NONE,
+            lambda *_a: setattr(self, "closed", True)))
+        st = self._call(M, sp, M + ".Session", "RecordMonitor", GLib.Variant("(sa{sv})", (
+            conn, {"cursor-mode": GLib.Variant("u", 0)}))).unpack()[0]
+        got = {}
+        self._subs.append(self._bus.signal_subscribe(
+            M, M + ".Stream", "PipeWireStreamAdded", st, None, self._Gio.DBusSignalFlags.NONE,
+            lambda *a: got.setdefault("node", a[-1].unpack()[0])))
+        self._call(M, sp, M + ".Session", "Start", None)
+        end = time.time() + 5
+        while "node" not in got and time.time() < end:
+            self._ctx.iteration(False)
+            time.sleep(0.02)
+        if "node" not in got:
+            self.error = "mutter: no stream"
+            return False
+        size = None
+        try:
+            p = self._call(M, st, "org.freedesktop.DBus.Properties", "Get",
+                           GLib.Variant("(ss)", (M + ".Stream", "Parameters"))).unpack()[0]
+            size = p.get("size")
+        except GLib.Error:
+            pass
+        self.backend, self.connector = "mutter", conn
+        return self._pipeline(f"pipewiresrc path={got['node']}", size, conf)
+
+    def _start_portal(self, conf):
+        GLib, Gio = self._GLib, self._Gio
+        self.error = None
+        bus, ctx = self._bus, self._ctx
         sender = bus.get_unique_name()[1:].replace(".", "_")
-        portal = ("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
-                  "org.freedesktop.portal.ScreenCast")
-        ctx = GLib.MainContext.default()
+        dest, opath = self.PORTAL
+        iface = "org.freedesktop.portal.ScreenCast"
+        try:
+            mons = self.monitors()
+        except GLib.Error:
+            mons = []
+        sig = self.setup_signature(mons)
+        declined = CONF_DIR / "portal-declined"
+        try:
+            if declined.read_text().strip() == sig:
+                self.error = "portal: share dialog was cancelled for this monitor setup"
+                return False
+        except OSError:
+            pass
+        token_file = TOKEN if in_service() else TOKEN_MANUAL
 
         def request(method, params, token, timeout=120):
             path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
@@ -560,10 +954,10 @@ class Screen:
 
             def on_resp(_c, _s, _p, _i, _sig, args):
                 result["code"], result["data"] = args.unpack()
-            sub = bus.signal_subscribe("org.freedesktop.portal.Desktop",
-                                       "org.freedesktop.portal.Request", "Response", path,
+            sub = bus.signal_subscribe(dest, "org.freedesktop.portal.Request", "Response", path,
                                        None, Gio.DBusSignalFlags.NO_MATCH_RULE, on_resp)
-            bus.call_sync(*portal, method, params, None, Gio.DBusCallFlags.NONE, -1, None)
+            bus.call_sync(dest, opath, iface, method, params, None, Gio.DBusCallFlags.NONE, -1,
+                          None)
             end = time.time() + timeout
             while "code" not in result and time.time() < end:
                 ctx.iteration(False)
@@ -571,59 +965,100 @@ class Screen:
             bus.signal_unsubscribe(sub)
             return result.get("code", 2), result.get("data", {})
 
-        tag = str(os.getpid())
+        tag = f"{os.getpid()}_{int(time.time())}"
         code, data = request("CreateSession", GLib.Variant("(a{sv})", ({
             "handle_token": GLib.Variant("s", f"gw_c{tag}"),
             "session_handle_token": GLib.Variant("s", f"gw_s{tag}")},)), f"gw_c{tag}")
         if code != 0:
-            self.error = "screen capture: could not create session"
+            self.error = "portal: could not create session"
             return False
         session = data["session_handle"]
+        self._session = ("portal", session)
+        self._subs.append(bus.signal_subscribe(
+            dest, "org.freedesktop.portal.Session", "Closed", session, None,
+            Gio.DBusSignalFlags.NONE, lambda *_a: setattr(self, "closed", True)))
+        # persist_mode 2 = until revoked. The reply to Start carries the token to use next
+        # time (GNOME keeps it while the restore works, issues a new one after a dialog).
         opts = {"handle_token": GLib.Variant("s", f"gw_sel{tag}"),
                 "types": GLib.Variant("u", 1), "multiple": GLib.Variant("b", False),
                 "cursor_mode": GLib.Variant("u", 1), "persist_mode": GLib.Variant("u", 2)}
-        if TOKEN.exists():
-            opts["restore_token"] = GLib.Variant("s", TOKEN.read_text().strip())
+        try:
+            old = token_file.read_text().strip()
+            if old:
+                opts["restore_token"] = GLib.Variant("s", old)
+        except OSError:
+            pass
         code, _ = request("SelectSources", GLib.Variant("(oa{sv})", (session, opts)),
                           f"gw_sel{tag}")
         if code != 0:
-            self.error = "screen capture: source selection refused"
+            self.error = "portal: source selection refused"
             return False
         code, data = request("Start", GLib.Variant("(osa{sv})", (session, "", {
             "handle_token": GLib.Variant("s", f"gw_st{tag}")})), f"gw_st{tag}", timeout=300)
         if code != 0 or not data.get("streams"):
-            self.error = "screen capture: permission not granted"
+            if code == 1 and sig:                 # cancelled: don't ask again for this setup
+                try:
+                    declined.write_text(sig + "\n")
+                except OSError:
+                    pass
+            self.error = "portal: permission not granted"
             return False
         if data.get("restore_token"):
-            TOKEN.write_text(data["restore_token"] + "\n")
+            token_file.write_text(data["restore_token"] + "\n")
+        try:
+            declined.unlink()
+        except OSError:
+            pass
         node, props = data["streams"][0]
         res, fds = bus.call_with_unix_fd_list_sync(
-            *portal, "OpenPipeWireRemote", GLib.Variant("(oa{sv})", (session, {})),
+            dest, opath, iface, "OpenPipeWireRemote", GLib.Variant("(oa{sv})", (session, {})),
             None, Gio.DBusCallFlags.NONE, -1, None, None)
-        fd = fds.get(res.unpack()[0])
+        self._fd = fds.get(res.unpack()[0])
+        self.backend = "portal"
+        return self._pipeline(f"pipewiresrc fd={self._fd} path={node}", props.get("size"), conf)
+
+    def _pipeline(self, src, size, conf):
         right = bottom = 0
-        if props.get("size"):
-            w, h = props["size"]
+        if size:
+            w, h = size
             right, bottom = max(0, w - self.CW), max(0, h - self.CH)
+            self.cropped = True
+        fps = max(5, min(30, int(conf.get("capture_fps", 15))))
         q = "queue leaky=downstream max-size-buffers=1"
-        desc = (f"pipewiresrc fd={fd} path={node} do-timestamp=true keepalive-time=1000 ! "
-                f"videorate max-rate=20 ! tee name=t "
-                f"t. ! {q} ! videoscale method=bilinear ! "
-                f"video/x-raw,width={self.W},height={self.H} ! videoconvert ! "
-                f"video/x-raw,format=RGB ! appsink name=sink max-buffers=1 drop=true sync=false "
+        # max-framerate is negotiated with GNOME, so frames above it are never produced or
+        # copied out of the GPU. Two-step scale: nearest (reads only sampled pixels) to 4x the
+        # target, then a cheap bilinear average to the final size.
+        desc = (f"{src} do-timestamp=true ! video/x-raw,max-framerate={fps}/1 ! tee name=t "
+                f"t. ! {q} ! videoscale method=nearest-neighbour ! "
+                f"video/x-raw,width={self.W * 4},height={self.H * 4} ! "
+                f"videoscale method=bilinear ! video/x-raw,width={self.W},height={self.H} ! "
+                f"videoconvert ! video/x-raw,format=RGB ! "
+                f"appsink name=sink max-buffers=1 drop=true sync=false "
                 f"t. ! {q} ! videocrop name=crop right={right} bottom={bottom} ! videoconvert ! "
                 f"video/x-raw,format=RGB ! appsink name=bridge max-buffers=1 drop=true sync=false")
         try:
-            self.pipeline = Gst.parse_launch(desc)
-        except GLib.Error as e:
+            self.pipeline = self._Gst.parse_launch(desc)
+        except self._GLib.Error as e:
             self.error = f"capture pipeline: {e.message}"
             return False
         self.sink = self.pipeline.get_by_name("sink")
         self.bridge = self.pipeline.get_by_name("bridge")
         self.crop = self.pipeline.get_by_name("crop")
-        self.pipeline.set_state(Gst.State.PLAYING)
-        self._Gst = Gst
+        self.pipeline.set_state(self._Gst.State.PLAYING)
         return True
+
+    # -- running ----------------------------------------------------------------------------
+    def pump(self):
+        """Handle D-Bus signals (stream closed) and pipeline errors; True while capturing."""
+        if not self.pipeline:
+            return False
+        while self._ctx.iteration(False):
+            pass
+        msg = self.pipeline.get_bus().pop_filtered(self._Gst.MessageType.ERROR)
+        if msg:
+            self.error = f"capture: {msg.parse_error()[0].message}"
+            self.closed = True
+        return not self.closed
 
     def _pull(self, sink):
         if not sink:
@@ -647,16 +1082,43 @@ class Screen:
     def strip(self):
         f = self._pull(self.bridge)
         if f and (f[0] > self.CW or f[1] > self.CH) and not self.cropped:
-            # the portal didn't say the size: crop now that the real size is known
+            # the backend didn't say the size: crop now that the real size is known
             self.crop.set_property("right", max(0, f[0] - self.CW))
             self.crop.set_property("bottom", max(0, f[1] - self.CH))
             self.cropped = True
         return f
 
+    def _close_session(self):
+        if self._session and self._bus:
+            kind, path = self._session
+            try:
+                if kind == "mutter":
+                    self._call(self.MUTTER, path, self.MUTTER + ".Session", "Stop", None, 2000)
+                else:
+                    self._call(self.PORTAL[0], path, "org.freedesktop.portal.Session", "Close",
+                               None, 2000)
+            except self._GLib.Error:
+                pass                     # already gone (GNOME closed it)
+        for sub in self._subs or []:
+            self._bus.signal_unsubscribe(sub)
+        self._subs = []
+        self._session = None
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
     def stop(self):
+        """Stop the pipeline AND end the GNOME session (else it stays open in the daemon)."""
         if self.pipeline:
             self.pipeline.set_state(self._Gst.State.NULL)
-        self.pipeline = self.sink = self.bridge = None
+            self.pipeline.get_state(2 * self._Gst.SECOND)
+        self.pipeline = self.sink = self.bridge = self.crop = None
+        self._close_session()
+        self.backend = None
+        self.cropped = False
 
 
 class Bridge:
@@ -793,16 +1255,72 @@ FAKE_ZONES = {
 
 
 # ---- WoW combat log (fallback + zone name) ---------------------------------------------
-def proc_running(pattern):
-    me = str(os.getpid())
-    for pid in os.listdir("/proc"):
-        if pid.isdigit() and pid != me:
-            try:
-                if pattern in Path(f"/proc/{pid}/cmdline").read_bytes():
-                    return True
-            except OSError:
-                pass
-    return False
+_wow = {"pid": None}
+
+
+def wow_pid():
+    """PID of the running Wow.exe, or None. Matches the process itself (comm / argv[0]), not
+    any shell or script whose command line merely mentions Wow.exe. Cached between calls."""
+    pid = _wow["pid"]
+    if pid and _is_wow(pid):
+        return pid
+    _wow["pid"] = None
+    for d in os.listdir("/proc"):
+        if d.isdigit() and _is_wow(d):
+            _wow["pid"] = d
+            return d
+    return None
+
+
+def _is_wow(pid):
+    try:
+        st = Path(f"/proc/{pid}/stat").read_text()
+        if st.rsplit(")", 1)[1].split()[0] in ("Z", "X"):
+            return False                      # exited, not yet reaped: not running
+        if st[st.index("(") + 1:st.rindex(")")].lower().encode() == WOW_EXE[:15] \
+                and len(WOW_EXE) <= 15:
+            return True
+    except (OSError, ValueError, IndexError):
+        return False
+    return _argv_is_wow(pid)
+
+
+def _argv_is_wow(pid):
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:1]
+    except OSError:
+        return False
+    # argv[0] only: "C:\\...\\Wow.exe" is the game; "grep Wow.exe" / shells are not
+    return argv[0].replace(b"\\", b"/").rsplit(b"/", 1)[-1].lower() == WOW_EXE
+
+
+def proc_age(pid):
+    """Seconds since the process started."""
+    try:
+        start = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19])
+        up = float(Path("/proc/uptime").read_text().split()[0])
+        return up - start / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def wow_window_up(visible=True):
+    """True once the game window is mapped (XWayland). None if it can't be checked.
+    visible=False: does the window exist at all (minimized counts)."""
+    try:
+        r = subprocess.run(["xdotool", "search"] + (["--onlyvisible"] if visible else [])
+                           + ["--name", "^World of Warcraft$"], capture_output=True, timeout=3,
+                           env={**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return bool(r.stdout.strip())
+
+
+def in_service():
+    try:
+        return Path("/proc/self/cgroup").read_text().strip().endswith("/govee-wow.service")
+    except OSError:
+        return False
 
 
 def newest_log():
@@ -991,6 +1509,7 @@ class Show:
     def apply_style(self, conf, name):
         """Switch style live (the hour schedule): daylight swaps the whole color vocabulary."""
         self.conf, self.st = conf, STYLES[name]
+        self.soft_until = None                # style change: crossfade instead of a jump
         cols = {**COLORS, **(DAY_COLORS if self.st.get("green") else {})}
         self.c = {k: hexrgb(v) for k, v in cols.items()}
 
@@ -1099,8 +1618,8 @@ class Show:
     def program(self, mode, p, t, beat, bar):
         """Base look of one pixel for one program: (r, g, b) 0-1."""
         lvl = self.conf["program_level"][mode]
-        if mode != "dead":
-            lvl = min(1.0, lvl * self.st.get("lift", 1.0))
+        if mode != "dead" and self.st.get("lift"):
+            lvl = min(max(lvl, self.st.get("lift_max", 1.0)), lvl * self.st["lift"])
         c = self.c
         if self.st.get("green") and mode in ("explore", "lounge", "cruise"):
             return self.day_program(mode, p, t, lvl)
@@ -1159,14 +1678,14 @@ class Show:
         z = zl[p.i] if zl and p.i < len(zl) else None
         if z is None:                         # no picture: palette gradient ground -> canopy
             return base
-        return mix_lch(base, greenify(z), self.conf.get("terrain_tint", 0.55))
+        return mix_hue(base, greenify(z), self.conf.get("terrain_tint", 0.55))
 
     def day_program(self, mode, p, t, lvl):
         """Daylight: ground rising into foliage on the lamps behind you, sky / canopy overhead,
         wind waves crossing the room left -> right, sun dapples drifting over the ceiling."""
         slow = 0.6 if mode == "lounge" else 1.0
         base = to_oklab(self.pal.at(p.u * 0.35 + p.h * 0.3 + t * slow / 45))
-        lab = mix_lch(self.terrain(p, base), self.sun, 0.16)
+        lab = mix_hue(self.terrain(p, base), self.sun, 0.16)
         if p.lamp:                            # deeper at the floor, brighter into the leaves
             k = 0.72 + 0.28 * ease(p.h)
             gust = 0.6 + 0.4 * math.sin(t * 0.07 * slow + 1.3)
@@ -1225,6 +1744,8 @@ class Show:
             hb = (math.exp(-((x - 0.02) / 0.04) ** 2) + 0.6 * math.exp(-((x - 0.2) / 0.05) ** 2))
             hb *= self.st["heartbeat"]
         self.fx = [f for f in self.fx if t - f.t0 < f.dur]
+        if self.soft_until is None:
+            self.soft_until = t + 2.5 if self.prev is not None else t
         if self.st.get("green") and t - self.sun_t > 30:     # the sun moves across the day
             self.sun, self.sun_t = sun_lab(), t
         elif self.sun is None:
@@ -1244,10 +1765,12 @@ class Show:
             for f in self.fx:
                 if t >= f.t0:
                     col = self.add_fx(f, p, idx, t - f.t0, col)
-            col = tuple(min(1.0, max(0.0, x)) * master for x in col)
+            col = scale(vivid(fit(col), self.st.get("vivid", 0.0)), master)
             if self.st.get("warm"):
                 col = warm(col)
             slew = self.st["slew"]
+            if t < self.soft_until:                     # just switched style: glide over
+                slew = min(slew, 0.5) if slew > 0 else 0.5
             if slew > 0 and self.prev is not None:      # hard brightness-change speed limit
                 lim = slew * dt
                 col = tuple(q + max(-lim, min(lim, x - q)) for x, q in zip(col, self.prev[idx]))
@@ -1406,6 +1929,10 @@ def watch():
     try:
         while True:
             try:
+                WATCHING.touch()             # tells the session to publish its frames
+            except OSError:
+                pass
+            try:
                 d = json.loads(FRAMEFILE.read_text())
                 fresh = time.time() - d["t"] < 2
             except (OSError, ValueError, KeyError):
@@ -1468,17 +1995,20 @@ def check(conf):
     print("Safety check over the full 75 s demo (combat, boss, low health, finales), per light.")
     print("Guideline (WCAG 2.3.1): no more than 3 flashes in any 1 second; red flashes count too.")
     print(f"{'style':10} {'flashes/s':>10} {'red flashes/s':>14} {'fastest change':>16} "
-          f"{'peak':>6} {'blue':>5}   verdict")
+          f"{'cap':>5} {'peak':>6} {'blue':>5}   verdict")
     for name in STYLES:
-        r = flash_report({**conf, "style": name, "night_style": "", "schedule": []})
-        ok = r["flash"] <= 3 and r["red"] <= 3
+        sconf = {**conf, "style": name, "night_style": "", "schedule": []}
+        cap = level_cap(sconf)
+        r = flash_report(sconf)
+        ok = r["flash"] <= 3 and r["red"] <= 3 and r["peak"] <= cap + 1e-6
         calm = r["flash"] <= 1 and r["jump"] <= 2
         verdict = "calm" if calm else "within guideline" if ok else "TOO FLASHY"
         mark = "  <- now" if name == style_name(conf) else ""
         print(f"{name:10} {r['flash']:>10.1f} {r['red']:>14.1f} {r['jump']:>13.1f}/s "
-              f"{r['peak']:>5.0f}% {r['blue'] * 100:>4.0f}%   {verdict}{mark}")
+              f"{cap:>4}% {r['peak']:>5.0f}% {r['blue'] * 100:>4.0f}%   {verdict}{mark}")
     print("fastest change = share of full brightness per second (1.0/s = dark to full in 1 s)")
-    print("peak = brightest any light gets (% of its maximum); blue = most blue in any color")
+    print("cap = style brightness cap (govee-wow max); peak = brightest any light gets "
+          "(% of its maximum, never above cap); blue = most blue in any color")
 
 
 # ---- daemon / demo ---------------------------------------------------------------------
@@ -1499,7 +2029,7 @@ def should_run(conf):
                 return False
         except OSError:
             return False
-    return proc_running(b"Wow.exe")
+    return wow_pid() is not None
 
 
 DEMO = [  # (second, action) for a 75 s run; scaled to other lengths
@@ -1528,16 +2058,39 @@ def session(conf, until=None, demo=False):
         lights.close()
         return
     show = Show(conf, build_room(lights.devices, conf))
+    note(f"session start ({'demo' if demo else 'Wow.exe pid ' + str(wow_pid())}), "
+        f"style {style_name(conf)}, cap {level_cap(conf)}%")
+    t_begin = time.time()
     lights.begin(level_cap(conf))
+    if until:
+        until += time.time() - t_begin            # the demo gets its full length
     screen, bridge = Screen(), Bridge()
-    if conf.get("screen", True) and not screen.start():
-        write_status(f"screen off: {screen.error}")
+    # Capture starts only once the game window has been up capture_delay s (never during the
+    # Battle.net launch / Play handoff), restarts silently if GNOME ends the stream (monitors
+    # changed), and the portal backend gets one retry per session at most (it may need a dialog).
+    want_screen = bool(conf.get("screen", True))
+    win_since, next_try, tries = None, 0.0, 0
+    screen_note = "" if want_screen else " · no screen"
+    if want_screen and demo:
+        if not screen.start(conf):
+            screen_note = f" · screen off: {screen.error}"
+        want_screen = False
+    status_text, watch_check, watching = None, 0.0, False
     logst = LogState(conf)
     log, fh = newest_log(), None
     if log and not demo:
         fh = open(log, "r", errors="replace")
         fh.seek(0, os.SEEK_END)
     last, last_check, t0, step = time.time(), 0.0, time.time(), 0
+    last_pid, why = 0.0, "ended"
+    # Belt and braces for "Exit Game" leaving a hung Wow.exe behind: the client writes
+    # "Client Destroy" to Client.log, and its window goes away.
+    client_log = LOGS / "Client.log"
+    try:
+        client_pos = client_log.stat().st_size
+    except OSError:
+        client_pos = 0
+    win_seen, win_gone = False, 0
     log_combat_was = False
     last_dump = 0.0
     try:
@@ -1559,20 +2112,72 @@ def session(conf, until=None, demo=False):
                     elif act[0] == "zone":
                         logst.zone = act[1]
                 if now >= until:
+                    why = "demo finished"
                     break
             else:
+                if now - last_pid > 0.5 and wow_pid() is None:   # cheap: cached /proc read
+                    why = "Wow.exe exited"
+                    break
+                last_pid = now if now - last_pid > 0.5 else last_pid
                 if now - last_check > 2.0:
                     last_check = now
                     live_conf = load_conf()
-                    if not should_run(live_conf):
+                    try:
+                        size = client_log.stat().st_size
+                        if size < client_pos:
+                            client_pos = 0
+                        if size > client_pos:
+                            with open(client_log, "rb") as cf:
+                                cf.seek(client_pos)
+                                tail = cf.read()
+                            client_pos = size
+                            if b"Client Destroy" in tail:
+                                why = "WoW client shut down (Client.log: Client Destroy)"
+                                break
+                    except OSError:
+                        pass
+                    w = wow_window_up(visible=False)
+                    win_seen = win_seen or bool(w)
+                    win_gone = win_gone + 1 if (win_seen and w is False) else 0
+                    if win_gone >= 3:                   # ~6 s with no game window at all
+                        why = "WoW window gone"
                         break
+                    if not should_run(live_conf):
+                        why = f"no longer wanted (when={live_conf.get('when')}, profile not couch?)"
+                        break
+                    if screen.pipeline and not screen.pump():
+                        screen_note = f" · {screen.error or 'capture ended'}, restarting"
+                        portal = screen.backend == "portal"
+                        screen.stop()
+                        next_try = now + 3
+                        if portal:
+                            tries += 1
+                    if want_screen and not screen.pipeline and now >= next_try and tries < 2:
+                        up = wow_window_up()
+                        if not up:      # no xdotool, or XWayland can't see the window
+                            pid = wow_pid()     # (game on its own display): process age
+                            up = bool(pid) and proc_age(pid) > 30
+                        win_since = (win_since or now) if up else None
+                        if win_since and now - win_since >= conf.get("capture_delay", 5):
+                            if screen.start(live_conf):
+                                screen_note = ""
+                                if screen.backend == "portal":
+                                    tries += 1
+                            else:
+                                screen_note = f" · screen off: {screen.error}"
+                                tries += 1
+                                next_try = now + 30
                     name = style_name(live_conf)
                     if STYLES[name] is not show.st:      # the schedule moved on: switch live
                         conf = live_conf
                         show.apply_style(conf, name)
-                        for ip in lights.devices:
-                            lights.send(ip, "brightness", {"value": level_cap(conf)})
-                            time.sleep(0.2)
+                        note(f"style -> {name}, cap {level_cap(conf)}%")
+                    if level_cap(live_conf) != lights.target:   # schedule or `govee-wow max`
+                        conf["max_level"] = live_conf.get("max_level", conf.get("max_level"))
+                        conf["level"] = live_conf["level"]
+                        conf["afterdark_level"] = live_conf.get("afterdark_level", 2)
+                        note(f"cap -> {level_cap(live_conf)}% (gliding)")
+                        lights.set_level(level_cap(live_conf))
                     newest = newest_log()
                     if newest and newest != log:
                         if fh:
@@ -1618,29 +2223,59 @@ def session(conf, until=None, demo=False):
                                    dt)
             frame_now = show.render(now, dt)
             lights.show(frame_now, conf, now)
-            if now - last_dump > 0.05:
+            if now - watch_check > 1.0:                # `govee-wow watch` open?
+                watch_check = now
+                try:
+                    watching = now - WATCHING.stat().st_mtime < 3
+                except OSError:
+                    watching = False
+            if watching and now - last_dump > 0.05:
                 last_dump = now
                 try:
-                    FRAMEFILE.write_text(json.dumps({"t": now, "status": STATUS.read_text().strip()
-                                                     if STATUS.exists() else "",
+                    FRAMEFILE.write_text(json.dumps({"t": now, "status": status_text or "",
                                                      "devs": frame_devs(show, frame_now)}))
                 except OSError:
                     pass
             src = "demo" if demo else "live" if bridge.live(now) else "combat log"
             if src == "combat log":
                 src += f" (lag-compensated {logst.delay:.1f}s)"
-            write_status(f"{show.mode} · {show.pal_name} · {len(lights.devices)} lights · "
-                         f"{src}{'' if screen.sink else ' · no screen'}")
+            text = (f"{show.mode} · {show.pal_name} · {len(lights.devices)} lights · {src}"
+                    + (f" · screen: {screen.backend} {screen.connector or ''}".rstrip()
+                       if screen.sink else screen_note or " · screen waits for the WoW window"))
+            if text != status_text:
+                status_text = text
+                write_status(text)
             time.sleep(max(0.0, 1.0 / conf["stream_hz"] - (time.time() - now)))
+    except BaseException as e:
+        why = f"{type(e).__name__} {e}".strip()
+        raise
     finally:
-        screen.stop()
+        note(f"session stop: {why}")
+        try:
+            screen.stop()
+        except Exception as e:                  # never let capture teardown skip the restore
+            note(f"screen stop failed: {e}")
+        try:
+            lights.fade_out(0.8)
+            end = time.time() + 0.8
+            while time.time() < end and lights.streaming:
+                lights.show(show.render(time.time(), 1 / 30), conf, time.time())
+                time.sleep(1 / 30)
+        except Exception:
+            pass
         lights.end()
         lights.close()
         if fh:
             fh.close()
 
 
+def _sigterm(_sig, _frm):
+    raise SystemExit(0)          # runs the finally blocks: capture stopped, lights restored
+
+
 def daemon():
+    signal.signal(signal.SIGTERM, _sigterm)
+    note("daemon up, waiting for WoW")
     write_status("waiting for WoW")
     while True:
         conf = load_conf()
@@ -1683,6 +2318,20 @@ def main():
         save_key("night_style", "afterdark" if sys.argv[2] == "auto" else "")
         print("after dark: " + (f"automatic {conf['night_from']}:00-{conf['night_to']}:00"
                                 if sys.argv[2] == "auto" else "off"))
+    elif arg == "max" and len(sys.argv) == 2:
+        conf = load_conf()
+        for name in STYLES:
+            print(f"  {name:10} {level_cap(conf, name):>3}%")
+        print(f"(master level {conf['level']}%; change with: govee-wow max STYLE N)")
+    elif arg == "max" and len(sys.argv) > 3 and sys.argv[2] in STYLES and sys.argv[3].isdigit():
+        conf, n = load_conf(), int(sys.argv[3])
+        if sys.argv[2] == "afterdark":
+            n = max(1, min(10, n))
+            save_key("afterdark_level", n)
+        else:
+            n = max(5, min(100, n))
+            save_key("max_level", {**conf.get("max_level", {}), sys.argv[2]: n})
+        print(f"{sys.argv[2]} brightness cap: {n}% (a running show glides there)")
     elif arg == "style" and len(sys.argv) > 2 and sys.argv[2] in STYLES:
         load_conf()
         save_key("style", sys.argv[2])

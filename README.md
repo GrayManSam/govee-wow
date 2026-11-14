@@ -16,12 +16,16 @@ what happens in the game about 0.1 s after it happens.
 
   | hours | style | look |
   |---|---|---|
-  | 07–18 | `daylight` | greens matched to the game's terrain (see below), up to 100% brightness |
-  | 18, 21–22 | `standard` | reds, hot pinks, purples, deep blues, flashes allowed |
-  | 19–20 | `party` | the full club show |
-  | 23–07 | `afterdark` | 2% brightness, warm ember colors only, zero blue, no flashes |
+  | 07:00–19:00 | `daylight` | vivid greens matched to the game's terrain (see below), max 60% |
+  | 20:00–23:00 | `standard` | reds, hot pinks, purples, deep blues, flashes allowed, max 50% |
+  | 19:00–20:00 | `party` | the full club show, max 55% |
+  | 23:00–07:00 | `afterdark` | 2% brightness, warm ember colors only, zero blue, no flashes |
 
-  Also available: `comfort` (no strobing at all; brightness change speed is hard-limited).
+  Each style has a hard brightness cap (`max_level` in the config, `govee-wow max STYLE N`):
+  nothing the show sends - flashes and cues included - can go above it, and cap changes
+  (including the hourly style switch) glide over a few seconds instead of jumping.
+
+  Also available: `comfort` (no strobing at all; brightness change speed is hard-limited, max 45%).
 
 ### Daylight: the room becomes the game world
 
@@ -50,7 +54,7 @@ flashes counted separately). `govee-wow check` prints the analysis for every sty
 
 1. **CouchLights addon (real time, recommended).** It draws a tiny 8-pixel color strip in the
    top-left corner of the screen. govee-wow reads it from a screen capture (GNOME
-   ScreenCast portal + PipeWire), so it knows combat / boss / dead / mounted / resting / health
+   Mutter ScreenCast + PipeWire), so it knows combat / boss / dead / mounted / resting / health
    and the last event within ~0.1 s. The same capture provides the picture for the colors.
 2. **Combat log (fallback).** Without the strip, it tails `Logs/WoWCombatLog*.txt` (run
    `/combatlog` in game). The log is written in bursts 1–3 s late, so cues are replayed through
@@ -84,8 +88,17 @@ govee-wow when always        # or "couch" if you also use wow-couch (TV-only)
 govee-wow demo 30 daylight   # 30 s demo on your real lights
 ```
 
-The first session asks once for screen-capture permission; the portal's restore token is then
-kept in `~/.config/govee-wow/screencast-token` (local only, never commit it).
+Screen capture uses GNOME's own `org.gnome.Mutter.ScreenCast` API on the TV (the monitor
+whose EDID is at least 100 cm wide or whose name contains "TV", else the primary; set
+`capture_monitor` to a connector such as `DP-3` to force one), so there is no "share your
+screen" dialog. It starts once the WoW window has been up `capture_delay` seconds (5), runs
+at `capture_fps` (15: GNOME copies every captured 4K frame out of the GPU, so keep it low)
+and ends with the game. If that API is unavailable it falls back to the desktop portal: one
+dialog, then a restore token in `~/.config/govee-wow/screencast-token` (the service) or
+`screencast-token-manual` (runs from a terminal, which the portal sees as another app).
+Local only, never commit them. `"capture": "portal"` or `"mutter"` forces a backend.
+
+The systemd unit runs the service at nice 10, idle I/O priority and a low CPU weight.
 
 ## Commands
 
@@ -96,7 +109,8 @@ govee-wow preview [s] [style] draws the show in the terminal (lights untouched)
 govee-wow watch               live mirror of what the lights are doing
 govee-wow check               flash / photosensitivity analysis of every style
 govee-wow style NAME          comfort | standard | party | afterdark | daylight
-govee-wow level N             overall brightness 10-100
+govee-wow level N             master brightness 10-100 (on top of the style caps)
+govee-wow max [STYLE N]       show / set a style's brightness cap in %
 govee-wow afterdark level N   after-dark brightness 1-10 %
 govee-wow when couch|always|never
 govee-wow-test [--live]       self-test (schedule, safety, strip decoding, log replay, addons)

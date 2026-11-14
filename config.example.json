@@ -12,7 +12,7 @@
     ],
     [
       7,
-      18,
+      19,
       "daylight"
     ],
     [
@@ -57,11 +57,16 @@
   "ceiling_pixels": 12,
   "stream_hz": 30,
   "hunter_cooldowns": [
+    "Rapid Fire",
     "Bestial Wrath",
-    "Trueshot",
-    "Coordinated Assault",
-    "Aspect of the Wild",
-    "Call of the Wild",
-    "Rapid Fire"
-  ]
+    "Aspect of the Hawk",
+    "Intimidation",
+    "Aimed Shot"
+  ],
+  "max_level": {
+    "daylight": 60,
+    "party": 55,
+    "standard": 50,
+    "comfort": 45
+  }
 }
