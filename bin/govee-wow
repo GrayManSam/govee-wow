@@ -1,0 +1,1717 @@
+#!/usr/bin/python3 -I
+"""govee-wow v4 - a club / 4DX-style light show for World of Warcraft: Forever (LAN only).
+
+  govee-wow                 status
+  govee-wow demo [secs] [style]   the whole show on the real lights, then restore (75 s)
+  govee-wow when couch      only in couch mode (TV plugged in)  [default]
+  govee-wow when always     whenever WoW / Battle.net runs
+  govee-wow when never      off
+  govee-wow palette NAME    auto (by zone) | club | velvet | midnight | neon
+  govee-wow level N         overall brightness 10-100 (default 100)
+  govee-wow style NAME      comfort | standard | party | afterdark | daylight
+  (schedule in config.json: 23-7 afterdark, 7-18 daylight, 19-20 party, else standard)
+  daylight = greens matched to the game's terrain: ceiling = sky/canopy, lamps = ground
+             rising into foliage, wind + sun dapples, sun arc teal morning -> gold evening
+  govee-wow afterdark auto  switch to afterdark automatically at night (23:00-07:00); off
+  govee-wow afterdark level N   after-dark brightness 1-10 % (default 2)
+  govee-wow preview [s] [style]   emulator: draws the show in this terminal, lights untouched
+  govee-wow watch           live mirror of what the real lights are doing right now
+  govee-wow check           flash/photosensitivity analysis of every style (WCAG 2.3.1)
+  govee-wow daemon          background service (systemd: govee-wow.service)
+
+The room is one canvas: lamp - ceiling ring - lamp. Everything is choreographed on it.
+  Programs (the base look, follow the game):
+    explore  "drone swarm": glowing points glide through the room over a flowing palette
+    lounge   resting in a city / inn: slow, deep, warm
+    cruise   mounted: light streaks race up the lamps, a comet circles the ceiling
+    combat   128 BPM: kick pulses, the lamps are VU meters of your action, ceiling chase
+    boss     140 BPM: purple/blue lighthouse sweeps, white-pink hits on the downbeat
+    dead     blackout to deep blue, a slow flatline pulse
+    + low health: a red heartbeat that speeds up as you drop
+  Cues (one-shot effects, ~0.1 s after they happen in game):
+    each spell you cast  -> a pink shockwave falls from the ceiling down the lamps
+    big cooldown         -> riser fills the lamps bottom to top, then bursts
+    kill                 -> firework: a rocket climbs the lamp and bursts into sparkles
+    hit taken            -> red surge from the floor;  big heal -> blue shimmer rising
+    new target           -> ceiling blip;  pulling into combat -> red "drop" wipe
+    level up / boss kill -> 5 s finale;  quest / achievement -> gold shimmer
+    zone change          -> palette wipe across the room
+Real-time data comes from the CouchLights addon (an 8-pixel strip in the top-left corner,
+read from the screen). Without it the combat log file is used (1-3 s late).
+Flash safety: every style stays within WCAG 2.3.1 (<= 3 flashes/s); "comfort" also caps how
+fast any light may change brightness, so it cannot strobe at all.
+Tuning: ~/.config/govee-wow/config.json.
+"""
+import base64
+import csv
+import json
+import math
+import os
+import random
+import socket
+import sys
+import time
+from pathlib import Path
+
+CONF_DIR = Path.home() / ".config/govee-wow"
+CONF = CONF_DIR / "config.json"
+TOKEN = CONF_DIR / "screencast-token"
+STATUS = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "govee-wow.status"
+PROFILE = Path.home() / ".config/gameprofile/current"
+LOGS = Path(os.environ.get("WOW_DIR") or Path.home() / "Games/battlenet/drive_c/Program Files (x86)/World of Warcraft/_forever_") / "Logs"   # WOW_DIR = your _forever_ folder
+
+CONF_VERSION = 4
+# Club palettes (sRGB). Reds, hot pinks, purples, deep blues - no whites, no greens.
+PALETTES = {
+    "club":     ["#ff1493", "#8a00ff", "#1a1aff", "#ff00c8", "#e0002a"],
+    "velvet":   ["#e0002a", "#ff0066", "#b000ff", "#ff1a8c"],
+    "midnight": ["#0a1cff", "#5a00ff", "#8a00ff", "#ff1493"],
+    "neon":     ["#ff00c8", "#0050ff", "#9b00ff", "#ff2a6d"],
+    "afterdark": ["#ff1000", "#b00000", "#ff4a00", "#ff6a00", "#d01800"],   # embers, no blue
+    # Daylight (7-18): greens only - emerald, moss, lime, jade, teal - picked by zone terrain.
+    "verdant":  ["#00e05a", "#00a040", "#7ddc1f", "#00c08a", "#3cff6e"],   # forests, default
+    "jungle":   ["#5aff00", "#00d26a", "#00b894", "#a8e000", "#00ff9c"],   # jungle, swamp
+    "glade":    ["#00e0a0", "#00b4a0", "#20ff80", "#00c8c0", "#40e070"],   # water, coast, snow
+    "savanna":  ["#a8e000", "#d4c000", "#60d020", "#c8ff40", "#40b830"],   # barrens, desert
+    "grove":    ["#00a070", "#008a5a", "#30d080", "#00c0a0", "#20b060"],   # shadowy, undead
+}
+GREEN_PALETTES = ("verdant", "jungle", "glade", "savanna", "grove")
+DAY_ZONE_PALETTES = [
+    (("stranglethorn", "jungle", "un'goro", "ungoro", "feralas", "swamp", "marsh", "zangar",
+      "sholazar", "dustwallow", "fen", "bog"), "jungle"),
+    (("barrens", "durotar", "orgrimmar", "tanaris", "desert", "badlands", "silithus",
+      "desolace", "thousand needles", "burning", "searing", "molten", "fire", "flame",
+      "hellfire", "mulgore", "thunder bluff", "arathi", "plains"), "savanna"),
+    (("winterspring", "dun morogh", "alterac", "frost", "ice", "snow", "northrend", "coast",
+      "sea", "harbor", "shore", "isle", "lake", "ocean", "darkshore", "booty bay", "river",
+      "falls"), "glade"),
+    (("tirisfal", "undercity", "scholomance", "stratholme", "duskwood", "shadow", "crypt",
+      "naxxramas", "karazhan", "felwood", "plaguelands", "deadwind", "silverpine"), "grove"),
+]
+ZONE_PALETTES = [
+    (("burning", "searing", "molten", "blackrock", "fire", "flame", "badlands", "ragefire",
+      "hellfire", "felwood", "infernal", "durotar", "orgrimmar", "barrens", "tanaris"), "velvet"),
+    (("winterspring", "dun morogh", "alterac", "frost", "ice", "snow", "northrend", "coast",
+      "sea", "harbor", "shore", "isle", "lake", "ocean", "darkshore", "booty bay"), "midnight"),
+    (("tirisfal", "undercity", "scholomance", "stratholme", "duskwood", "shadow", "crypt",
+      "naxxramas", "karazhan", "dalaran", "arcane", "azshara", "moonglade", "sanctum"), "neon"),
+]
+COLORS = {
+    "red": "#ff0010", "crimson": "#d0002a", "hotpink": "#ff1493", "magenta": "#ff00c8",
+    "purple": "#8a00ff", "violet": "#5a00ff", "deepblue": "#0a1cff", "blue": "#0050ff",
+    "gold": "#ffa000", "flash": "#ffb4e6", "ice": "#40a0ff", "amber": "#ff6a00",
+    "hurt": "#ff0010", "sun": "#ffd27a",
+}
+# Daylight recolors the same choreography into the green family (+ sunlight gold accents).
+DAY_COLORS = {
+    "red": "#00e040", "crimson": "#008a3a", "hotpink": "#7dff00", "magenta": "#00ffa0",
+    "purple": "#00e0a0", "violet": "#00a080", "deepblue": "#007a50", "blue": "#00b3a0",
+    "gold": "#ffd000", "flash": "#e0ffc0", "ice": "#40ffd0", "amber": "#b8e000",
+    "hurt": "#ffa000", "sun": "#f0ff90",
+}
+# Sun over the day (hour, OKLab tint): dewy teal morning -> bright lime noon -> golden late.
+SUN_ARC = [(7, "#30e0b0"), (10, "#60ff80"), (13, "#a8ff40"), (16, "#d0e030"), (18, "#e0c030")]
+
+# Styles. "slew" = the most a light's brightness may change per second (full range = 1.0);
+# it is a hard limit applied last, so no effect can strobe faster than the style allows.
+STYLES = {
+    "comfort":  {"flash": False, "max_flashes": 1, "speed": 0.55, "slew": 0.9, "fx": 0.5,
+                 "pulse": 0.35, "heartbeat": 0.45, "boss_hits": False, "screen_flashes": False},
+    "standard": {"flash": True, "max_flashes": 2, "speed": 0.85, "slew": 4.0, "fx": 0.8,
+                 "pulse": 0.7, "heartbeat": 0.7, "boss_hits": True, "screen_flashes": True},
+    "party":    {"flash": True, "max_flashes": 3, "speed": 1.0, "slew": 0.0, "fx": 1.0,
+                 "pulse": 1.0, "heartbeat": 1.0, "boss_hits": True, "screen_flashes": True},
+    # After dark: never above 2% (dimmer locked at "afterdark_level", default 2, max 10), only warm eye-friendly colors
+    # (red / deep orange / amber, zero blue), no flashes, very slow and gentle.
+    "afterdark": {"flash": False, "max_flashes": 0, "speed": 0.4, "slew": 0.5, "fx": 0.4,
+                  "pulse": 0.2, "heartbeat": 0.3, "boss_hits": False, "screen_flashes": False,
+                  "max_level": 2, "warm": True},
+    # Daylight (7-18): the standard show recolored green; at rest the room becomes the game's
+    # world - ceiling = sky / canopy overhead, lamps = ground rising into foliage behind you,
+    # wind waves crossing left -> right, sun dapples drifting across the ceiling.
+    "daylight": {"flash": True, "max_flashes": 2, "speed": 0.85, "slew": 2.2, "fx": 0.8,
+                 "pulse": 0.7, "heartbeat": 0.7, "boss_hits": True, "screen_flashes": True,
+                 "green": True, "lift": 1.45},   # daytime: base looks run near 100%
+}
+
+
+def style_name(conf):
+    """The style in effect now: the time-of-day schedule if there is one, else `night_style`
+    during night hours, else `style`."""
+    h = time.localtime().tm_hour
+    if conf.get("schedule"):
+        for a, b, name in conf["schedule"]:
+            if name in STYLES and ((h >= a or h < b) if a > b else a <= h < b):
+                return name
+        d = conf.get("schedule_default")
+        return d if d in STYLES else "standard"
+    ns = conf.get("night_style")
+    if ns in STYLES:
+        h = time.localtime().tm_hour
+        a, b = conf["night_from"], conf["night_to"]
+        if (h >= a or h < b) if a > b else a <= h < b:
+            return ns
+    return conf.get("style") if conf.get("style") in STYLES else "comfort"
+
+
+def level_cap(conf):
+    """Govee dimmer % for this session: after dark uses its own tiny level (1-10)."""
+    st = STYLES[style_name(conf)]
+    if st.get("warm"):
+        return max(1, min(10, int(conf.get("afterdark_level", st["max_level"]))))
+    return min(conf["level"], st.get("max_level", 100))
+
+
+def warm(c):
+    """Night filter: any color -> red / deep orange / amber of the same strength, zero blue."""
+    v = max(c)
+    if v <= 0:
+        return (0.0, 0.0, 0.0)
+    t = min(1.0, (c[1] + 0.5 * c[2]) / (c[0] + c[1] + c[2]) * 2)
+    return (v, 0.42 * t * v, 0.0)
+
+DEFAULTS = {
+    "version": CONF_VERSION,
+    "when": "couch",
+    "style": "comfort",           # comfort | standard | party | afterdark  (govee-wow check)
+    "night_style": "",
+    "afterdark_level": 2,         # after-dark dimmer % (1-10)
+    # Style by time of day: [from_hour, to_hour, style]; hours not listed use schedule_default.
+    "schedule": [[23, 7, "afterdark"], [7, 18, "daylight"], [19, 20, "party"]],
+    "terrain_tint": 0.55,         # daylight: how much the game's terrain colors drive the room
+    "schedule_default": "standard",            # e.g. "afterdark": used automatically night_from..night_to
+    "palette": "auto",
+    "level": 100,                 # overall brightness % (Govee dimmer is set to this)
+    "night_scale": 1.0,           # e.g. 0.7 = 30% dimmer between night_from and night_to
+    "night_from": 23, "night_to": 7,
+    # base brightness of each program (0-1, on top of "level")
+    "program_level": {"explore": 0.62, "lounge": 0.5, "cruise": 0.7, "combat": 0.8,
+                      "boss": 0.9, "dead": 0.14},
+    "bpm": {"explore": 96, "lounge": 84, "cruise": 120, "combat": 128, "boss": 140, "dead": 30},
+    "drones": 3,                  # glowing points gliding through the room in explore mode
+    "low_health": 0.35,           # heartbeat below this health
+    "max_flashes_per_s": 3,       # photosensitivity guard for full-room flashes
+    "screen": True,               # read the CouchLights strip + picture from the screen
+    "screen_tint": 0.25,          # how much the game picture tints the explore palette
+    "screen_flashes": True,       # sudden bright frames (explosions, lightning) flash the room
+    "room": [],                   # device IPs left -> right; empty = lamp, ceiling, lamp
+    "lamp_segments": 15, "lamp_bottom_first": True, "lamp_hz": 12,
+    "ceiling_pixels": 12, "stream_hz": 30,
+    "hunter_cooldowns": ["Bestial Wrath", "Trueshot", "Coordinated Assault",
+                         "Aspect of the Wild", "Call of the Wild", "Rapid Fire"],
+}
+MINE, HOSTILE, T_PLAYER, T_PET, T_GUARDIAN = 0x1, 0x40, 0x400, 0x1000, 0x2000
+DAMAGE = ("SWING_DAMAGE", "RANGE_DAMAGE", "SPELL_DAMAGE", "SPELL_PERIODIC_DAMAGE")
+
+
+def load_conf():
+    CONF_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        user = json.loads(CONF.read_text()) if CONF.exists() else {}
+    except ValueError:
+        user = {}
+    if user.get("version", 1) < CONF_VERSION:
+        keep = {k: user[k] for k in ("when",) if k in user}
+        user = {**json.loads(json.dumps(DEFAULTS)), **keep}
+        CONF.write_text(json.dumps(user, indent=2) + "\n")
+    conf = json.loads(json.dumps(DEFAULTS))
+    for k, v in user.items():
+        if isinstance(v, dict) and isinstance(conf.get(k), dict):
+            conf[k].update(v)
+        else:
+            conf[k] = v
+    return conf
+
+
+def save_key(key, value):
+    conf = json.loads(CONF.read_text()) if CONF.exists() else json.loads(json.dumps(DEFAULTS))
+    conf[key] = value
+    CONF.write_text(json.dumps(conf, indent=2) + "\n")
+
+
+# ---- color ---------------------------------------------------------------------------
+def hexrgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def _lin(c):
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _gam(c):
+    c = max(0.0, min(1.0, c))
+    return 12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+
+
+def to_oklab(rgb):
+    r, g, b = (_lin(x) for x in rgb)
+    l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    return (0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+            1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+            0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s)
+
+
+def from_oklab(lab):
+    L, a, b = lab
+    l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3
+    m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3
+    s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3
+    return (_gam(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s),
+            _gam(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s),
+            _gam(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s))
+
+
+def mix_lch(a, b, t):
+    """Blend around the hue wheel: pink -> purple -> blue, never through gray."""
+    ca, cb = math.hypot(a[1], a[2]), math.hypot(b[1], b[2])
+    ha, hb = math.atan2(a[2], a[1]), math.atan2(b[2], b[1])
+    dh = (hb - ha + math.pi) % (2 * math.pi) - math.pi
+    h, c = ha + dh * t, ca + (cb - ca) * t
+    return (a[0] + (b[0] - a[0]) * t, c * math.cos(h), c * math.sin(h))
+
+
+def mix(a, b, t):
+    return tuple(x + (y - x) * t for x, y in zip(a, b))
+
+
+def scale(c, k):
+    return (c[0] * k, c[1] * k, c[2] * k)
+
+
+def ease(t):
+    t = max(0.0, min(1.0, t))
+    return t * t * (3 - 2 * t)
+
+
+def frac(x):
+    return x - math.floor(x)
+
+
+GREEN_HUE = (math.radians(112), math.radians(188))     # OKLab hue: yellow-green .. teal
+
+
+def greenify(lab, lmin=0.55, lmax=0.86, cmin=0.11):
+    """Any scene color -> the nearest green: hue clamped into lime..teal, never gray or dim.
+    Mossy/olive terrain stays mossy, water stays teal, brown earth becomes yellow-green."""
+    L, a, b = lab
+    c, h = math.hypot(a, b), math.atan2(b, a) % (2 * math.pi)
+    lo, hi = GREEN_HUE
+    if not lo <= h <= hi:
+        dlo = min(abs(h - lo), 2 * math.pi - abs(h - lo))
+        dhi = min(abs(h - hi), 2 * math.pi - abs(h - hi))
+        h = lo if dlo < dhi else hi
+    c = max(cmin, min(0.26, c))
+    L = max(lmin, min(lmax, L))
+    return (L, c * math.cos(h), c * math.sin(h))
+
+
+def sun_lab(now=None):
+    """Sunlight tint for this moment of the day (smooth OKLab blend along SUN_ARC)."""
+    lt = time.localtime(now)
+    x = lt.tm_hour + lt.tm_min / 60 + lt.tm_sec / 3600
+    pts = [(h, to_oklab(hexrgb(c))) for h, c in SUN_ARC]
+    if x <= pts[0][0]:
+        return pts[0][1]
+    for (h0, a), (h1, b) in zip(pts, pts[1:]):
+        if x <= h1:
+            return mix_lch(a, b, ease((x - h0) / (h1 - h0)))
+    return pts[-1][1]
+
+
+class Palette:
+    def __init__(self, hexes):
+        self.labs = [to_oklab(hexrgb(h)) for h in hexes]
+        self.cache = {}
+
+    def at(self, x):
+        """Loop through the palette; x in any range. Cached at 1/512 steps."""
+        k = int(frac(x) * 512)
+        c = self.cache.get(k)
+        if c is None:
+            n = len(self.labs)
+            p = k / 512 * n
+            i = int(p)
+            c = from_oklab(mix_lch(self.labs[i % n], self.labs[(i + 1) % n], ease(p - i)))
+            self.cache[k] = c
+        return c
+
+    def tinted(self, lab, w):
+        out = Palette([])
+        out.labs = [mix_lch(p, lab, w) for p in self.labs]
+        return out
+
+
+def palette_for(conf, zone):
+    st = STYLES[style_name(conf)]
+    if st.get("warm"):
+        return "afterdark"
+    if st.get("green"):
+        z = (zone or "").lower()
+        return next((p for words, p in DAY_ZONE_PALETTES if any(w in z for w in words)),
+                    "verdant")
+    name = conf.get("palette", "auto")
+    if name not in PALETTES or name == "afterdark" or name in GREEN_PALETTES:
+        z = (zone or "").lower()
+        name = next((p for words, p in ZONE_PALETTES if any(w in z for w in words)), "club")
+    return name
+
+
+# ---- Govee LAN -------------------------------------------------------------------------
+def _xor(bs):
+    c = 0
+    for x in bs:
+        c ^= x
+    return c
+
+
+def razer(payload):
+    b = bytearray(payload)
+    b.append(_xor(b))
+    return base64.b64encode(bytes(b)).decode()
+
+
+def ptreal_segment(rgb, mask):
+    b = [0x33, 0x05, 0x15, 0x01, *rgb, 0, 0, 0, 0, 0, mask & 0xFF, (mask >> 8) & 0xFF]
+    b += [0] * (19 - len(b))
+    return base64.b64encode(bytes(b + [_xor(b)])).decode()
+
+
+class Lights:
+    STREAM_SKUS = {"H1370"}                  # live per-pixel stream ("razer")
+    SEGMENT_SKUS = {"H6076"}                 # per-segment colors ("ptReal")
+
+    def __init__(self):
+        self.rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.rx.bind(("", 4002))
+        self.rx.settimeout(0.3)
+        self.tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.tx.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        self.devices = {}                    # ip -> sku
+        self.saved = {}
+        self.sent = {}
+        self.last_lamp = 0.0
+        self.streaming = False
+
+    def close(self):
+        self.rx.close()
+        self.tx.close()
+
+    def send(self, ip, cmd, data):
+        try:
+            self.tx.sendto(json.dumps({"msg": {"cmd": cmd, "data": data}}).encode(), (ip, 4003))
+        except OSError:
+            pass
+
+    def _drain(self, seconds, want):
+        out, end = {}, time.time() + seconds
+        while time.time() < end:
+            try:
+                raw, addr = self.rx.recvfrom(4096)
+                msg = json.loads(raw)["msg"]
+            except (socket.timeout, ValueError, KeyError):
+                continue
+            if msg.get("cmd") == want:
+                out[addr[0]] = msg.get("data", {})
+        return out
+
+    def discover(self):
+        scan = json.dumps({"msg": {"cmd": "scan", "data": {"account_topic": "reserve"}}}).encode()
+        for _ in range(3):
+            try:
+                self.tx.sendto(scan, ("239.255.255.250", 4001))
+            except OSError:
+                pass
+            for ip, d in self._drain(0.8, "scan").items():
+                self.devices[ip] = d.get("sku", "?")
+        return self.devices
+
+    def begin(self, level):
+        for ip in self.devices:
+            self.send(ip, "devStatus", {})
+        self.saved = self._drain(1.5, "devStatus")
+        # Dimmer set ONCE; all motion is in the colors. Govee drops back-to-back commands.
+        for ip in self.devices:
+            self.send(ip, "turn", {"value": 1})
+            time.sleep(0.2)
+            self.send(ip, "brightness", {"value": int(max(1, min(100, level)))})
+            time.sleep(0.2)
+        for _ in range(2):
+            for ip, sku in self.devices.items():
+                if sku in self.STREAM_SKUS:
+                    self.send(ip, "razer", {"pt": razer([0xBB, 0, 1, 0xB1, 1])})
+            time.sleep(0.3)
+        self.streaming = True
+        self.sent = {}
+
+    def end(self):
+        if not self.streaming:
+            return
+        for ip, sku in self.devices.items():
+            if sku in self.STREAM_SKUS:
+                self.send(ip, "razer", {"pt": razer([0xBB, 0, 1, 0xB1, 0])})
+        time.sleep(0.6)                      # devices ignore commands right after stream mode
+        for ip, s in self.saved.items():
+            if s.get("colorTemInKelvin"):
+                self.send(ip, "colorwc", {"color": {"r": 0, "g": 0, "b": 0},
+                                          "colorTemInKelvin": s["colorTemInKelvin"]})
+            else:
+                self.send(ip, "colorwc", {"color": s.get("color", {"r": 255, "g": 255, "b": 255}),
+                                          "colorTemInKelvin": 0})
+            time.sleep(0.2)
+            self.send(ip, "brightness", {"value": s.get("brightness", 100)})
+            if not s.get("onOff", 1):
+                time.sleep(0.2)
+                self.send(ip, "turn", {"value": 0})
+        self.streaming = False
+
+    def show(self, frame, conf, now):
+        """frame: ip -> list of (r, g, b) floats 0-1 (lamps bottom -> top)."""
+        for ip, cols in frame.items():
+            if self.devices.get(ip) in self.STREAM_SKUS:
+                n = len(cols)
+                ln = 2 + 3 * n
+                pkt = [0xBB, ln >> 8, ln & 0xFF, 0xB0, 1, n]
+                for c in cols:
+                    pkt += [int(round(max(0.0, min(1.0, x)) * 255)) for x in c]
+                self.send(ip, "razer", {"pt": razer(pkt)})
+        if now - self.last_lamp < 1.0 / conf["lamp_hz"]:
+            return
+        self.last_lamp = now
+        for ip, cols in frame.items():
+            if self.devices.get(ip) not in self.SEGMENT_SKUS:
+                continue
+            if not conf["lamp_bottom_first"]:
+                cols = cols[::-1]
+            prev = self.sent.setdefault(ip, [None] * len(cols))
+            batch = []
+            for i, c in enumerate(cols):
+                rgb = tuple(int(round(max(0.0, min(1.0, x)) * 255)) for x in c)
+                if prev[i] is not None and max(abs(a - b) for a, b in zip(rgb, prev[i])) < 4:
+                    continue
+                batch.append(ptreal_segment(rgb, 1 << i))
+                prev[i] = rgb
+            if batch:                        # the whole lamp in ONE message: moves as one piece
+                self.send(ip, "ptReal", {"command": batch})
+
+
+# ---- the room canvas -------------------------------------------------------------------
+class Px:
+    __slots__ = ("ip", "i", "u", "h", "ring", "lamp")
+
+    def __init__(self, ip, i, u, h, ring, lamp):
+        self.ip, self.i, self.u, self.h, self.ring, self.lamp = ip, i, u, h, ring, lamp
+
+
+def build_room(devices, conf):
+    """Lay the lights out on a line through the room: lamp - ceiling ring - lamp."""
+    lamps = sorted(ip for ip, s in devices.items() if s in Lights.SEGMENT_SKUS)
+    rings = sorted(ip for ip, s in devices.items() if s in Lights.STREAM_SKUS)
+    order = [ip for ip in conf.get("room") or [] if ip in devices]
+    if not order:
+        order = lamps[:1] + rings + lamps[1:]
+    order += [ip for ip in lamps + rings if ip not in order]
+    pixels, n = [], len(order)
+    for k, ip in enumerate(order):
+        u = k / (n - 1) if n > 1 else 0.5
+        if ip in rings:
+            m = conf["ceiling_pixels"]
+            for i in range(m):
+                th = i / m
+                pixels.append(Px(ip, i, u + 0.22 * math.cos(2 * math.pi * th), 1.0, th, False))
+        else:
+            m = conf["lamp_segments"]
+            for i in range(m):
+                pixels.append(Px(ip, i, u, i / (m - 1), 0.0, True))
+    return pixels
+
+
+# ---- screen: GNOME portal + PipeWire (picture + CouchLights strip) ----------------------
+class Screen:
+    W, H = 96, 54            # downscaled picture for colors / flashes
+    CW, CH = 200, 80         # unscaled top-left crop where the CouchLights strip lives
+
+    def __init__(self):
+        self.pipeline = self.sink = self.bridge = self.crop = None
+        self.error = None
+        self.cropped = False
+
+    def start(self):
+        try:
+            import gi
+            gi.require_version("Gst", "1.0")
+            from gi.repository import Gio, GLib, Gst
+        except (ImportError, ValueError) as e:
+            self.error = f"GStreamer not available: {e}"
+            return False
+        Gst.init(None)
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        sender = bus.get_unique_name()[1:].replace(".", "_")
+        portal = ("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                  "org.freedesktop.portal.ScreenCast")
+        ctx = GLib.MainContext.default()
+
+        def request(method, params, token, timeout=120):
+            path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+            result = {}
+
+            def on_resp(_c, _s, _p, _i, _sig, args):
+                result["code"], result["data"] = args.unpack()
+            sub = bus.signal_subscribe("org.freedesktop.portal.Desktop",
+                                       "org.freedesktop.portal.Request", "Response", path,
+                                       None, Gio.DBusSignalFlags.NO_MATCH_RULE, on_resp)
+            bus.call_sync(*portal, method, params, None, Gio.DBusCallFlags.NONE, -1, None)
+            end = time.time() + timeout
+            while "code" not in result and time.time() < end:
+                ctx.iteration(False)
+                time.sleep(0.02)
+            bus.signal_unsubscribe(sub)
+            return result.get("code", 2), result.get("data", {})
+
+        tag = str(os.getpid())
+        code, data = request("CreateSession", GLib.Variant("(a{sv})", ({
+            "handle_token": GLib.Variant("s", f"gw_c{tag}"),
+            "session_handle_token": GLib.Variant("s", f"gw_s{tag}")},)), f"gw_c{tag}")
+        if code != 0:
+            self.error = "screen capture: could not create session"
+            return False
+        session = data["session_handle"]
+        opts = {"handle_token": GLib.Variant("s", f"gw_sel{tag}"),
+                "types": GLib.Variant("u", 1), "multiple": GLib.Variant("b", False),
+                "cursor_mode": GLib.Variant("u", 1), "persist_mode": GLib.Variant("u", 2)}
+        if TOKEN.exists():
+            opts["restore_token"] = GLib.Variant("s", TOKEN.read_text().strip())
+        code, _ = request("SelectSources", GLib.Variant("(oa{sv})", (session, opts)),
+                          f"gw_sel{tag}")
+        if code != 0:
+            self.error = "screen capture: source selection refused"
+            return False
+        code, data = request("Start", GLib.Variant("(osa{sv})", (session, "", {
+            "handle_token": GLib.Variant("s", f"gw_st{tag}")})), f"gw_st{tag}", timeout=300)
+        if code != 0 or not data.get("streams"):
+            self.error = "screen capture: permission not granted"
+            return False
+        if data.get("restore_token"):
+            TOKEN.write_text(data["restore_token"] + "\n")
+        node, props = data["streams"][0]
+        res, fds = bus.call_with_unix_fd_list_sync(
+            *portal, "OpenPipeWireRemote", GLib.Variant("(oa{sv})", (session, {})),
+            None, Gio.DBusCallFlags.NONE, -1, None, None)
+        fd = fds.get(res.unpack()[0])
+        right = bottom = 0
+        if props.get("size"):
+            w, h = props["size"]
+            right, bottom = max(0, w - self.CW), max(0, h - self.CH)
+        q = "queue leaky=downstream max-size-buffers=1"
+        desc = (f"pipewiresrc fd={fd} path={node} do-timestamp=true keepalive-time=1000 ! "
+                f"videorate max-rate=20 ! tee name=t "
+                f"t. ! {q} ! videoscale method=bilinear ! "
+                f"video/x-raw,width={self.W},height={self.H} ! videoconvert ! "
+                f"video/x-raw,format=RGB ! appsink name=sink max-buffers=1 drop=true sync=false "
+                f"t. ! {q} ! videocrop name=crop right={right} bottom={bottom} ! videoconvert ! "
+                f"video/x-raw,format=RGB ! appsink name=bridge max-buffers=1 drop=true sync=false")
+        try:
+            self.pipeline = Gst.parse_launch(desc)
+        except GLib.Error as e:
+            self.error = f"capture pipeline: {e.message}"
+            return False
+        self.sink = self.pipeline.get_by_name("sink")
+        self.bridge = self.pipeline.get_by_name("bridge")
+        self.crop = self.pipeline.get_by_name("crop")
+        self.pipeline.set_state(Gst.State.PLAYING)
+        self._Gst = Gst
+        return True
+
+    def _pull(self, sink):
+        if not sink:
+            return None
+        sample = sink.emit("try-pull-sample", 0)
+        if not sample:
+            return None
+        buf = sample.get_buffer()
+        ok, info = buf.map(self._Gst.MapFlags.READ)
+        if not ok:
+            return None
+        data = bytes(info.data)
+        buf.unmap(info)
+        caps = sample.get_caps().get_structure(0)
+        w, h = caps.get_value("width"), caps.get_value("height")
+        return w, h, len(data) // h, data
+
+    def frame(self):
+        return self._pull(self.sink)
+
+    def strip(self):
+        f = self._pull(self.bridge)
+        if f and (f[0] > self.CW or f[1] > self.CH) and not self.cropped:
+            # the portal didn't say the size: crop now that the real size is known
+            self.crop.set_property("right", max(0, f[0] - self.CW))
+            self.crop.set_property("bottom", max(0, f[1] - self.CH))
+            self.cropped = True
+        return f
+
+    def stop(self):
+        if self.pipeline:
+            self.pipeline.set_state(self._Gst.State.NULL)
+        self.pipeline = self.sink = self.bridge = None
+
+
+class Bridge:
+    """Reads the CouchLights strip: magenta | 6 data cells | cyan, each cell 3 bits."""
+
+    def __init__(self):
+        self.where = None           # (x, y, pitch)
+        self.last_seen = float("-inf")
+        self.seq = None
+        self.last_scan = 0.0
+
+    @staticmethod
+    def _px(f, x, y):
+        w, h, stride, data = f
+        if not (0 <= x < w and 0 <= y < h):
+            return None
+        i = y * stride + 3 * x
+        return data[i], data[i + 1], data[i + 2]
+
+    @staticmethod
+    def _magenta(p):
+        return p and p[0] > 170 and p[1] < 90 and p[2] > 170
+
+    def _read(self, f, x, y, p):
+        vals = []
+        for k in range(8):
+            c = self._px(f, x + k * p + p // 2, y)
+            if c is None:
+                return None
+            vals.append((c[0] > 128) | (c[1] > 128) << 1 | (c[2] > 128) << 2)
+        return vals[1:7] if vals[0] == 5 and vals[7] == 6 else None
+
+    def _scan(self, f):
+        w, h = f[0], f[1]
+        for y in range(h):
+            for x in range(w):
+                if self._magenta(self._px(f, x, y)):
+                    run = 0
+                    while x + run < w and self._magenta(self._px(f, x + run, y)):
+                        run += 1
+                    if run >= 3:
+                        yc = y + run // 2
+                        for p in (run, run + 1, run - 1):
+                            if self._read(f, x, yc, p):
+                                return x, yc, p
+                    break                       # only the first magenta on a row counts
+        return None
+
+    def decode(self, f, now):
+        if f is None:
+            return None
+        vals = self._read(f, *self.where) if self.where else None
+        if vals is None and now - self.last_scan > 0.5:
+            self.last_scan = now
+            self.where = self._scan(f)
+            vals = self._read(f, *self.where) if self.where else None
+        if vals is None:
+            return None
+        self.last_seen = now
+        return vals
+
+    def live(self, now):
+        return now - self.last_seen < 3.0
+
+
+def analyze(frame):
+    """Dominant vivid color of the game picture (OKLab) + mean luminance; UI edges skipped."""
+    w, h, stride, data = frame
+    x0, x1, y0, y1 = int(w * 0.12), int(w * 0.88), int(h * 0.08), int(h * 0.76)
+    acc, wsum, total, n = [0.0, 0.0, 0.0], 0.0, 0.0, 0
+    for y in range(y0, y1, 2):
+        row = y * stride
+        for x in range(x0, x1, 2):
+            i = row + 3 * x
+            r, g, b = data[i], data[i + 1], data[i + 2]
+            mx, mn = max(r, g, b), min(r, g, b)
+            total += (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+            n += 1
+            if mx < 20 or mn > 235:
+                continue
+            wgt = ((mx - mn) / mx) ** 2
+            acc[0] += r * wgt; acc[1] += g * wgt; acc[2] += b * wgt
+            wsum += wgt
+    lab = to_oklab([c / wsum / 255 for c in acc]) if wsum > 1 else None
+    return lab, total / max(1, n)
+
+
+def _zone_color(data, stride, xs, ys):
+    """Saturation-weighted mean of one screen zone (OKLab), None if it is black / pure UI white
+    (black-bar + black-screen rejection, as in Hyperion / Govee TV backlights)."""
+    acc, wsum = [0.0, 0.0, 0.0], 0.0
+    for y in ys:
+        row = y * stride
+        for x in xs:
+            i = row + 3 * x
+            r, g, b = data[i], data[i + 1], data[i + 2]
+            mx, mn = max(r, g, b), min(r, g, b)
+            if mx < 24 or mn > 235:
+                continue
+            wgt = 0.15 + ((mx - mn) / mx) ** 2            # vivid pixels win, gray still counts
+            acc[0] += r * wgt; acc[1] += g * wgt; acc[2] += b * wgt
+            wsum += wgt
+    return to_oklab([c / wsum / 255 for c in acc]) if wsum > 0.5 else None
+
+
+def zones(frame, lamp_n, ring_n, depth=0.14):
+    """Ambilight-style edge zones mapped to where the lights are in the room:
+    left edge (bottom -> top) -> left lamp, right edge -> right lamp, top band -> ceiling.
+    The bottom 22% (action bars, chat) is skipped, like a TV backlight's black-bar crop."""
+    w, h, stride, data = frame
+    y0, y1 = int(h * 0.06), int(h * 0.78)
+    dx = max(2, int(w * depth))
+    out = {"left": [], "right": [], "top": []}
+    for i in range(lamp_n):                               # segment 0 = floor = low on screen
+        a = y1 - (i + 1) * (y1 - y0) / lamp_n
+        ys = range(max(y0, int(a)), max(int(a) + 1, int(a + (y1 - y0) / lamp_n)))
+        out["left"].append(_zone_color(data, stride, range(1, 1 + dx), ys))
+        out["right"].append(_zone_color(data, stride, range(w - 1 - dx, w - 1), ys))
+    ys = range(y0, y0 + max(2, int(h * 0.22)))
+    for i in range(ring_n):                               # ring pixel -> column across the top
+        cx = 0.5 + 0.42 * math.cos(2 * math.pi * i / ring_n)
+        x0 = int(cx * w) - w // (2 * ring_n) - 1
+        out["top"].append(_zone_color(data, stride, range(max(0, x0), min(w, x0 + w // ring_n + 2)),
+                                      ys))
+    return out
+
+
+# Stand-in world for preview / demo without a screen: earth -> grass -> canopy, open sky.
+FAKE_ZONES = {
+    "left":  [to_oklab(hexrgb(c)) for c in ("#6b5a2a",) * 3 + ("#4a7a2a",) * 5 + ("#2f8a3a",) * 7],
+    "right": [to_oklab(hexrgb(c)) for c in ("#5d6a2c",) * 4 + ("#3f8a34",) * 5 + ("#2a7a5a",) * 6],
+    "top":   [to_oklab(hexrgb(c)) for c in ("#5aa0e0", "#6ab0e8", "#3a9a50", "#2f8a3a") * 3],
+}
+
+
+# ---- WoW combat log (fallback + zone name) ---------------------------------------------
+def proc_running(pattern):
+    me = str(os.getpid())
+    for pid in os.listdir("/proc"):
+        if pid.isdigit() and pid != me:
+            try:
+                if pattern in Path(f"/proc/{pid}/cmdline").read_bytes():
+                    return True
+            except OSError:
+                pass
+    return False
+
+
+def newest_log():
+    try:
+        return max(LOGS.glob("WoWCombatLog*.txt"), key=lambda p: p.stat().st_mtime, default=None)
+    except OSError:
+        return None
+
+
+def hexflags(v):
+    try:
+        return int(v, 16)
+    except (TypeError, ValueError):
+        return 0
+
+
+def log_time(stamp):
+    """'11/13/2026 23:17:42.142-5' -> epoch seconds (the game writes local time)."""
+    try:
+        d, t = stamp.split(" ")[:2]
+        t = t.split("-")[0].split("+")[0]
+        hms, ms = (t.split(".") + ["0"])[:2]
+        st = time.strptime(f"{d} {hms}", "%m/%d/%Y %H:%M:%S")
+        return time.mktime(st) + int(ms) / 10 ** len(ms)
+    except (ValueError, IndexError):
+        return None
+
+
+class LogState:
+    """The combat log FILE, made usable despite its 1-3 s bursty lag.
+
+    The log is a delayed, jittery feed, so it is handled like a live-video jitter buffer:
+      1. Every line carries the game's own timestamp, so the true moment of each event is
+         known even though we read it late. Lag = (clock now) - (event time) is measured on
+         every line.
+      2. Playout delay = the 85th percentile of the last ~40 s of lag samples (adapts up
+         fast, down slowly). Events are replayed at event_time + delay, so a burst of
+         10 lines read at once plays back with the real rhythm of the fight, not as one blob.
+      3. Late is worse than never for beat-sync cues: a shockwave that lands 2 s after the
+         hit just looks random. Cues that miss their slot by more than `late_s` become
+         energy (the combat program pumps harder) instead of firing off-beat. Meaningful
+         moments (kill, cooldown, level up, boss kill) still fire up to `stale_s` late.
+      4. State (in combat, boss, dead) runs on the same delayed clock so moods and cues
+         stay consistent with each other; the combat program keeps the beat going in the
+         gaps (dead reckoning), with its tempo locked to your measured attack cadence.
+    The CouchLights strip (~0.1 s) replaces all of this whenever it is on screen."""
+
+    TRANSIENT = {1, 3, 4, 7}                     # cast, hit taken, heal, target blip
+    late_s, stale_s = 0.35, 4.0
+
+    def __init__(self, conf):
+        self.conf = conf
+        self.me = None
+        self.last_combat = float("-inf")         # event time (game clock)
+        self.boss = False
+        self.dead = False
+        self.zone = None
+        self.queue = []                          # (event_time, code, detail)
+        self.lags = []                           # (read_at, lag)
+        self.delay = 1.0
+        self.cadence = None                      # seconds between your hits (EMA)
+        self.last_hit = None
+        self.events = self.queue                 # cleared when the strip takes over
+
+    def feed(self, line, now):
+        parts = line.split("  ", 1)
+        if len(parts) != 2:
+            return
+        ts = log_time(parts[0]) or now
+        lag = now - ts
+        if -1 < lag < 15:
+            self.lags.append((now, lag))
+        try:
+            f = next(csv.reader([parts[1].strip()]))
+        except (csv.Error, StopIteration):
+            return
+        ev = f[0]
+        add = lambda code, detail=0: self.queue.append((ts, code, detail))  # noqa: E731
+        if ev == "ZONE_CHANGE" and len(f) > 2:
+            self.zone = f[2]
+            return
+        if ev == "ENCOUNTER_START":
+            self.boss = True
+            return
+        if ev == "ENCOUNTER_END":
+            self.boss = False
+            if len(f) > 5 and f[5] == "1":
+                add(6, 7)
+            return
+        if len(f) < 8:
+            return
+        src, sfl, dst, dfl = f[1], hexflags(f[3]), f[5], hexflags(f[7])
+        src_me = sfl & MINE and sfl & T_PLAYER
+        dst_me = dfl & MINE and dfl & T_PLAYER
+        if src_me:
+            self.me = src
+        if ev == "UNIT_DIED" and (dst_me or (self.me and dst == self.me)):
+            self.dead = True
+            return
+        if self.dead and (src_me or (ev == "SPELL_RESURRECT" and dst_me)):
+            self.dead = False
+        if ev == "PARTY_KILL" and src_me:
+            add(2)
+            return
+        if src_me and ev == "SPELL_CAST_SUCCESS" and len(f) > 10 and f[10] != "Auto Shot":
+            add(1, 1 if f[10] in self.conf["hunter_cooldowns"] else 0)
+        if ev.startswith(DAMAGE):
+            mine_s = sfl & MINE and sfl & (T_PLAYER | T_PET | T_GUARDIAN)
+            mine_d = dfl & MINE and dfl & (T_PLAYER | T_PET | T_GUARDIAN)
+            if (mine_s and dfl & HOSTILE) or (mine_d and sfl & HOSTILE):
+                self.last_combat = max(self.last_combat, ts)
+            if src_me and dfl & HOSTILE:
+                if self.last_hit is not None and 0.3 < ts - self.last_hit < 4:
+                    gap = ts - self.last_hit
+                    self.cadence = gap if self.cadence is None else self.cadence * 0.8 + gap * 0.2
+                self.last_hit = ts
+            if dst_me and sfl & HOSTILE:
+                add(3, 1)
+
+    def update_delay(self, now):
+        self.lags = [(t, v) for t, v in self.lags if now - t < 40][-400:]
+        if len(self.lags) >= 5:
+            vals = sorted(v for _, v in self.lags)
+            target = min(3.0, max(0.15, vals[int(len(vals) * 0.85)] + 0.05))
+            k = 0.5 if target > self.delay else 0.02     # up fast, down slowly
+            self.delay += (target - self.delay) * k
+
+    def clock(self, now):
+        """The delayed playout clock, in game time."""
+        return now - self.delay
+
+    def due(self, now):
+        """Events whose playout moment has come: [(code, detail, how_late_s)]."""
+        self.update_delay(now)
+        play = self.clock(now)
+        out, keep = [], []
+        for ts, code, detail in sorted(self.queue):
+            if ts <= play:
+                out.append((code, detail, play - ts))
+            else:
+                keep.append((ts, code, detail))
+        self.queue[:] = keep
+        return out
+
+    def combat_bpm(self):
+        """Lock the combat beat to your attack rhythm: 1, 2 or 4 beats per hit, 110-150 BPM."""
+        if not self.cadence:
+            return None
+        base = 60 / self.cadence
+        options = [base * 2 ** k for k in range(8)]
+        return min(150.0, max(100.0, min(options, key=lambda b: abs(b - 128))))
+
+
+# ---- the show --------------------------------------------------------------------------
+class FX:
+    __slots__ = ("kind", "t0", "dur", "col", "k", "data")
+
+    def __init__(self, kind, t0, dur, col, k=1.0, data=None):
+        self.kind, self.t0, self.dur, self.col, self.k, self.data = kind, t0, dur, col, k, data
+
+
+class Show:
+    def __init__(self, conf, pixels):
+        self.conf = conf
+        self.px = pixels
+        self.pal_name = None
+        self.zl = {}                          # smoothed edge zones (OKLab) for daylight
+        self.sun, self.sun_t = None, -1e9
+        self.pal = Palette(PALETTES["club"])
+        self.scene_lab = None
+        self.mode, self.prev_mode, self.mode_t = "explore", "explore", -10.0
+        self.phase, self.bpm = 0.0, 96.0
+        self.bpm_hint = None
+        self.energy = 0.0
+        self.hp = 1.0
+        self.fx = []
+        self.flashes = []
+        self.lum_avg = 0.3
+        self.hb_phase = 0.0
+        self.state = {"combat": False, "boss": False, "dead": False, "mounted": False,
+                      "resting": False, "instance": False}
+        self.apply_style(conf, style_name(conf))
+        self.mt = 0.0                         # motion clock (runs slower in calm styles)
+        self.prev = None                      # last output, for the brightness slew limit
+
+    def apply_style(self, conf, name):
+        """Switch style live (the hour schedule): daylight swaps the whole color vocabulary."""
+        self.conf, self.st = conf, STYLES[name]
+        cols = {**COLORS, **(DAY_COLORS if self.st.get("green") else {})}
+        self.c = {k: hexrgb(v) for k, v in cols.items()}
+
+    # -- inputs --
+    def set_zones(self, z, dt):
+        """Temporal smoothing per zone (~0.35 s), so the room follows the world, not the noise."""
+        a = 1 - math.exp(-dt / 0.35)
+        for side, labs in z.items():
+            cur = self.zl.setdefault(side, [None] * len(labs))
+            for i, lab in enumerate(labs):
+                if lab is not None:
+                    cur[i] = lab if cur[i] is None else mix(cur[i], lab, a)
+
+    def set_palette(self, name, now):
+        if name != self.pal_name:
+            first = self.pal_name is None
+            self.pal_name = name
+            self.base_pal = Palette(PALETTES[name])
+            self.pal = self.base_pal
+            if not first:
+                self.cue("wipe", now, col=self.base_pal.at(0.0))
+
+    def set_scene(self, lab, lum, now, game_visible=True):
+        if lab is not None and self.conf["screen_tint"] > 0:
+            self.scene_lab = lab if self.scene_lab is None else mix(self.scene_lab, lab, 0.08)
+            self.pal = self.base_pal.tinted(self.scene_lab, self.conf["screen_tint"])
+        if (self.conf["screen_flashes"] and self.st["screen_flashes"] and game_visible and lum - self.lum_avg > 0.2
+                and self.mode != "dead"):
+            self.flash(now, self.c["flash"], 0.7)
+        self.lum_avg += (lum - self.lum_avg) * 0.1
+
+    def set_state(self, now, **st):
+        old = dict(self.state)
+        self.state.update(st)
+        s = self.state
+        mode = ("dead" if s["dead"] else "boss" if s["boss"] else "combat" if s["combat"]
+                else "cruise" if s["mounted"] else "lounge" if s["resting"] else "explore")
+        if mode != self.mode:
+            self.prev_mode, self.mode, self.mode_t = self.mode, mode, now
+            if mode == "combat" and not old["combat"]:
+                self.cue("wipe", now, col=self.c["red"])          # the drop
+                self.flash(now, self.c["hotpink"], 0.8)
+            elif mode == "boss":
+                self.cue("wipe", now, col=self.c["purple"])
+                self.flash(now, self.c["flash"], 1.0)
+            elif mode == "dead":
+                self.cue("wipe", now, col=self.c["deepblue"], k=0.6)
+
+    def event(self, code, detail, now):
+        c = self.c
+        if code == 1:                                   # spell cast
+            self.energy = min(1.0, self.energy + 0.18)
+            if detail == 1:
+                self.cue("power", now)
+            else:
+                col = self.pal.at(random.random()) if self.mode in ("explore", "lounge", "cruise") \
+                    else (c["hotpink"] if random.random() < 0.6 else c["magenta"])
+                self.cue("ring", now, col=col)
+        elif code == 2:                                 # kill
+            self.energy = min(1.0, self.energy + 0.3)
+            self.cue("firework", now)
+        elif code == 3:                                 # hit taken
+            self.energy = min(1.0, self.energy + 0.1)
+            self.cue("hurt", now, k=0.5 + detail / 10)
+        elif code == 4:                                 # big heal
+            self.cue("heal", now, k=0.6 + detail / 14)
+        elif code == 5:                                 # level up
+            self.cue("finale", now)
+        elif code == 6:                                 # quest / achievement / boss kill
+            self.cue("finale" if detail == 7 else "shimmer", now)
+        elif code == 7:                                 # new hostile target
+            self.cue("blip", now)
+
+    def cue(self, kind, now, col=None, k=1.0):
+        c = self.c
+        dur = {"ring": 0.55, "power": 1.5, "firework": 1.6, "hurt": 0.6, "heal": 0.9,
+               "finale": 5.0, "shimmer": 1.4, "blip": 0.25, "wipe": 0.9}[kind]
+        data = None
+        if kind in ("firework", "finale", "shimmer"):
+            n = {"firework": 18, "finale": 70, "shimmer": 14}[kind]
+            rocket = random.choice([p.ip for p in self.px if p.lamp] or [None])
+            data = ([(random.randrange(len(self.px)), random.uniform(0.3 if kind == "firework"
+                                                                     else 0, dur - 0.3),
+                      random.choice([c["gold"], c["hotpink"], c["magenta"], c["flash"],
+                                     c["ice"]] if kind != "shimmer" else [c["gold"], c["amber"]]))
+                     for _ in range(n)], rocket)
+        if kind == "power" or kind == "finale":
+            self.flash(now + (0.9 if kind == "power" else 0), c["flash"], 1.0, force=True)
+        self.fx.append(FX(kind, now, dur / self.st["speed"], col, k, data))
+        if len(self.fx) > 24:
+            self.fx = self.fx[-24:]
+
+    def flash(self, now, col, k, force=False):
+        """Full-room flash, rate-limited (photosensitivity guard). Calm styles swell instead."""
+        self.flashes = [t for t in self.flashes if now - t < 1.0]
+        limit = min(self.conf["max_flashes_per_s"], self.st["max_flashes"])
+        if len(self.flashes) >= limit and not (force and self.st["flash"]):
+            return
+        self.flashes.append(now)
+        if self.st["flash"]:
+            self.fx.append(FX("flash", now, 0.18, col, k))
+        else:
+            self.fx.append(FX("swell", now, 1.2, col, k * 0.35))
+
+    # -- rendering --
+    def program(self, mode, p, t, beat, bar):
+        """Base look of one pixel for one program: (r, g, b) 0-1."""
+        lvl = self.conf["program_level"][mode]
+        if mode != "dead":
+            lvl = min(1.0, lvl * self.st.get("lift", 1.0))
+        c = self.c
+        if self.st.get("green") and mode in ("explore", "lounge", "cruise"):
+            return self.day_program(mode, p, t, lvl)
+        if mode in ("explore", "lounge"):
+            slow = 0.6 if mode == "lounge" else 1.0
+            col = self.pal.at(p.u * 0.45 + p.h * 0.3 + t * slow / 40)
+            k = lvl * (0.8 + 0.2 * math.sin(2 * math.pi * (bar / 2 + p.u + p.h * 0.5)))
+            out = scale(col, k)
+            for d in range(self.conf["drones"] if mode == "explore" else 1):
+                du = 0.5 + 0.55 * math.sin(t * (0.21 + 0.07 * d) * slow + d * 2.1)
+                dh = 0.5 + 0.5 * math.sin(t * (0.33 + 0.05 * d) * slow + d * 1.3)
+                g = math.exp(-((p.u - du) ** 2 + ((p.h - dh) * 0.8) ** 2) / 0.018)
+                if g > 0.01:
+                    dc = self.pal.at(d / 3 + t / 60 + 0.5)
+                    out = tuple(o + x * g * 0.9 for o, x in zip(out, dc))
+            return out
+        if mode == "cruise":
+            col = self.pal.at(t / 12 + p.u * 0.5)
+            if p.lamp:
+                s = frac(p.h * 1.4 - t * 1.1 + p.u * 0.37)
+                g = math.exp(-((s - 0.5) * 5) ** 2)
+            else:
+                g = math.exp(-(((frac(p.ring - t * 0.8) - 0.5) * 4) ** 2))
+            return scale(col, lvl * (0.3 + 0.7 * g))
+        if mode == "combat":
+            kick = math.exp(-beat * 6)
+            pd = self.st["pulse"]
+            col = mix(c["red"], c["magenta"], 0.5 + 0.5 * math.sin(2 * math.pi * (bar / 2 + p.u)))
+            if p.lamp:
+                fill = 0.2 + 0.8 * self.energy
+                lit = 1.0 if p.h <= fill else max(0.15, 1 - (p.h - fill) * 6)
+                top = p.h <= fill and p.h > fill - 0.12
+                col = mix(col, c["hotpink"], 0.6) if top else col
+                return scale(col, lvl * lit * (1 - 0.4 * pd + 0.4 * pd * kick))
+            step = int(self.phase * 2)
+            on = (int(p.ring * self.conf["ceiling_pixels"]) + step) % 3 == 0
+            col = c["purple"] if (step // 2) % 2 else col
+            return scale(col, lvl * (1.0 if on else 1 - 0.7 * pd) * (1 - 0.3 * pd + 0.3 * pd * kick))
+        if mode == "boss":
+            x = p.u if p.lamp else p.ring
+            sweep = frac(self.phase / 4)
+            g = max(0.0, math.cos(2 * math.pi * (x - sweep))) ** 6
+            col = mix(c["deepblue"], c["purple"], g)
+            if p.lamp:
+                g = max(g, 0.5 * max(0.0, math.cos(math.pi * (p.h - frac(self.phase / 2))) ** 8))
+            return scale(col, lvl * (0.3 + 0.7 * g) * (1 - 0.15 * self.st["pulse"]
+                                                     * (1 - math.exp(-beat * 5))))
+        # dead: deep blue, a slow flatline pulse
+        g = math.exp(-((frac(t / 4) - 0.1) / 0.06) ** 2)
+        return scale(c["deepblue"], lvl * (0.8 + 1.2 * g))
+
+    def terrain(self, p, base):
+        """The game world behind / above you at this pixel, pulled into the green family."""
+        side = "top" if not p.lamp else "left" if p.u < 0.5 else "right"
+        zl = self.zl.get(side)
+        z = zl[p.i] if zl and p.i < len(zl) else None
+        if z is None:                         # no picture: palette gradient ground -> canopy
+            return base
+        return mix_lch(base, greenify(z), self.conf.get("terrain_tint", 0.55))
+
+    def day_program(self, mode, p, t, lvl):
+        """Daylight: ground rising into foliage on the lamps behind you, sky / canopy overhead,
+        wind waves crossing the room left -> right, sun dapples drifting over the ceiling."""
+        slow = 0.6 if mode == "lounge" else 1.0
+        base = to_oklab(self.pal.at(p.u * 0.35 + p.h * 0.3 + t * slow / 45))
+        lab = mix_lch(self.terrain(p, base), self.sun, 0.16)
+        if p.lamp:                            # deeper at the floor, brighter into the leaves
+            k = 0.72 + 0.28 * ease(p.h)
+            gust = 0.6 + 0.4 * math.sin(t * 0.07 * slow + 1.3)
+            w = (math.sin(2 * math.pi * (p.h * 0.7 - t * 0.09 * slow + p.u * 0.35))
+                 + 0.5 * math.sin(2 * math.pi * (p.h * 1.3 - t * 0.21 * slow + p.u * 0.6) + 1))
+            k *= 0.84 + 0.16 * gust * w / 1.5
+        else:
+            k = 0.9 + 0.1 * math.sin(2 * math.pi * (p.ring - t * 0.02 * slow))
+        rgb = from_oklab(lab)                 # full-strength LED color: terrain sets the hue,
+        m = max(rgb) or 1.0                   # the show sets the brightness (never murky)
+        out = scale(rgb, lvl * k / m)
+        if mode == "cruise":                  # riding: streaks race up through the world
+            if p.lamp:
+                g = math.exp(-((frac(p.h * 1.4 - t * 1.1 + p.u * 0.37) - 0.5) * 5) ** 2)
+            else:
+                g = math.exp(-(((frac(p.ring - t * 0.8) - 0.5) * 4) ** 2))
+            return scale(out, 0.45 + 0.75 * g)
+        sun = from_oklab(mix_lch(to_oklab(self.c["sun"]), self.sun, 0.3))
+        if not p.lamp:                        # sun through the leaves, clouds come and go
+            for d in range(3):
+                pos = frac(d / 3 + t * 0.012 * slow * (1 + 0.35 * d)
+                           + 0.04 * math.sin(t * 0.23 + d * 1.7))
+                dist = min(abs(p.ring - pos), 1 - abs(p.ring - pos))
+                g = math.exp(-(dist / 0.08) ** 2) * (0.55 + 0.45 * math.sin(t * 0.05 + d * 2))
+                out = tuple(o + x * g * 0.45 for o, x in zip(out, sun))
+        for d in range(self.conf["drones"] if mode == "explore" else 1):   # fireflies / pollen
+            du = 0.5 + 0.55 * math.sin(t * (0.17 + 0.06 * d) * slow + d * 2.1)
+            dh = 0.5 + 0.5 * math.sin(t * (0.29 + 0.05 * d) * slow + d * 1.3)
+            g = math.exp(-((p.u - du) ** 2 + ((p.h - dh) * 0.8) ** 2) / 0.012)
+            if g > 0.01:
+                out = tuple(o + x * g * 0.6 for o, x in zip(out, sun))
+        return out
+
+    def render(self, t, dt):
+        conf = self.conf
+        want = conf["bpm"][self.mode]
+        if self.mode == "combat" and self.bpm_hint:
+            want = self.bpm_hint
+        self.bpm += (want - self.bpm) * min(1.0, dt * 1.5)
+        sp = self.st["speed"]
+        self.phase += dt * self.bpm / 60 * sp
+        self.mt += dt * sp
+        mt = self.mt
+        beat, bar = frac(self.phase), self.phase / 4
+        self.energy *= math.exp(-dt / 2.5)
+        if (self.st["boss_hits"] and self.mode == "boss" and int(self.phase) % 4 == 0
+                and beat < dt * self.bpm / 60 * sp):
+            self.flash(t, self.c["flash"], 0.6)            # downbeat hit
+        xf = ease((t - self.mode_t) / 0.8)
+        low = conf["low_health"]
+        hb = 0.0
+        if self.hp < low and self.mode != "dead":
+            rate = (70 + (low - self.hp) / low * 80) * (0.6 + 0.4 * self.st["heartbeat"])
+            self.hb_phase += dt * rate / 60
+            x = frac(self.hb_phase)
+            hb = (math.exp(-((x - 0.02) / 0.04) ** 2) + 0.6 * math.exp(-((x - 0.2) / 0.05) ** 2))
+            hb *= self.st["heartbeat"]
+        self.fx = [f for f in self.fx if t - f.t0 < f.dur]
+        if self.st.get("green") and t - self.sun_t > 30:     # the sun moves across the day
+            self.sun, self.sun_t = sun_lab(), t
+        elif self.sun is None:
+            self.sun = sun_lab()
+        night = time.localtime().tm_hour
+        a, b = conf["night_from"], conf["night_to"]
+        is_night = (night >= a or night < b) if a > b else a <= night < b
+        master = conf["night_scale"] if is_night else 1.0
+        frame, out = {}, []
+        for idx, p in enumerate(self.px):
+            col = self.program(self.mode, p, mt, beat, bar)
+            if xf < 1:
+                col = mix(self.program(self.prev_mode, p, mt, beat, bar), col, xf)
+            if hb > 0:
+                col = tuple(x * (1 - 0.4 * min(1, hb)) for x in col)
+                col = tuple(x + y * 0.9 * hb for x, y in zip(col, self.c["hurt"]))
+            for f in self.fx:
+                if t >= f.t0:
+                    col = self.add_fx(f, p, idx, t - f.t0, col)
+            col = tuple(min(1.0, max(0.0, x)) * master for x in col)
+            if self.st.get("warm"):
+                col = warm(col)
+            slew = self.st["slew"]
+            if slew > 0 and self.prev is not None:      # hard brightness-change speed limit
+                lim = slew * dt
+                col = tuple(q + max(-lim, min(lim, x - q)) for x, q in zip(col, self.prev[idx]))
+            out.append(col)
+            frame.setdefault(p.ip, []).append(col)
+        self.prev = out
+        return frame
+
+    def add_fx(self, f, p, idx, age, col):
+        r = age / f.dur
+        age *= self.st["speed"]                   # effects play slower in calm styles
+        fxg = self.st["fx"]
+        c = self.c
+        g, fc = 0.0, f.col
+        if f.kind == "flash":
+            g = f.k * (1 - r) ** 2
+        elif f.kind == "swell":                       # comfort replacement for a flash
+            g = f.k * math.sin(math.pi * r) ** 2
+        elif f.kind == "ring":                        # shockwave falls from the ceiling
+            front = 1.15 - r * 1.4
+            g = math.exp(-((p.h - front) / 0.14) ** 2) * (1 - r) * 0.9
+        elif f.kind == "wipe":                        # sweeps across the room
+            front = r * 1.5 - 0.2
+            g = f.k * math.exp(-((p.u - front) / 0.16) ** 2)
+        elif f.kind == "hurt":                        # red surge from the floor
+            g = f.k * math.exp(-p.h / 0.35) * (1 - r) ** 2
+            fc = c["hurt"]
+        elif f.kind == "heal":                        # blue shimmer rising
+            g = f.k * 0.7 * math.exp(-((p.h - r * 1.2) / 0.15) ** 2) * (1 - r)
+            fc = c["ice"]
+        elif f.kind == "blip":
+            g = 0.0 if p.lamp else 0.7 * (1 - r)
+            fc = c["hotpink"]
+        elif f.kind == "power":                       # riser, then burst
+            if age < 0.9:
+                fill = age / 0.9
+                g = 1.0 if (p.lamp and p.h <= fill) or (not p.lamp and fill > 0.95) else 0.0
+                fc = mix(c["magenta"], c["gold"], p.h)
+            else:
+                g = (1 - (age - 0.9) / 0.6) ** 2
+                fc = c["gold"]
+        elif f.kind in ("firework", "finale", "shimmer"):
+            sparks, rocket = f.data
+            if f.kind == "firework" and age < 0.35 and p.ip == rocket and p.lamp:
+                g = math.exp(-((p.h - age / 0.35) / 0.08) ** 2)       # the rocket climbs
+                fc = c["gold"]
+            if f.kind == "finale":                    # fast club chase under the sparkles
+                col = mix(col, self.pal.at(p.u * 2 + p.h + age * 1.6), 0.8 * (1 - r) ** 0.5)
+                col = scale(col, 1.0 + 0.3 * (1 - r))
+            for i, t0, sc in sparks:
+                if i == idx:
+                    s = fxg * math.exp(-((age - t0) / (0.09 / fxg ** 0.5)) ** 2)
+                    if s > 0.01:
+                        col = tuple(x + y * s for x, y in zip(col, sc))
+        if f.kind not in ("flash", "swell"):
+            g *= fxg
+        if g > 0.005 and fc is not None:
+            col = tuple(x + y * g for x, y in zip(col, fc))
+        return col
+
+
+# ---- emulator + safety check -----------------------------------------------------------
+FRAMEFILE = STATUS.with_name("govee-wow.frame")
+FAKE_ROOM = {"lamp-left": "H6076", "ceiling": "H1370", "lamp-right": "H6076"}
+
+
+def frame_devs(show, frame):
+    """Room-ordered [(kind, colors)] for drawing."""
+    order = list(dict.fromkeys(p.ip for p in show.px))
+    lamps = {p.ip for p in show.px if p.lamp}
+    return [("lamp" if ip in lamps else "ring", frame[ip]) for ip in order]
+
+
+def draw(devs, header):
+    """Truecolor drawing of the room: lamps as columns (top = top), ceiling ring above."""
+    W, H, top = 46, 24, 8
+    grid = [[None] * W for _ in range(H)]
+    lamp_x = [2, W - 6]
+    li = 0
+    for kind, cols in devs:
+        if kind == "lamp":
+            x = lamp_x[min(li, 1)]
+            li += 1
+            n = len(cols)
+            for i, c in enumerate(cols):          # i = 0 is the bottom segment
+                y = top + round((n - 1 - i) * (H - top - 1) / max(1, n - 1))
+                grid[y][x] = grid[y][x + 1] = c
+        else:
+            n = len(cols)
+            for i, c in enumerate(cols):
+                th = 2 * math.pi * i / n
+                x = W // 2 + round(14 * math.cos(th))
+                y = 3 + round(2.6 * math.sin(th))
+                grid[y][x] = grid[y][x + 1] = c
+    out = ["\x1b[H\x1b[0m" + header.ljust(W + 20)]
+    for row in grid:
+        line = []
+        for c in row:
+            if c is None:
+                line.append("\x1b[0m ")
+            else:
+                r, g, b = (int(max(0, min(1, v)) * 255) for v in c)
+                line.append(f"\x1b[38;2;{r};{g};{b}m█")
+        out.append("".join(line) + "\x1b[0m")
+    sys.stdout.write("\n".join(out) + "\n")
+    sys.stdout.flush()
+
+
+def demo_frames(conf, secs=75.0, fps=30, seed=7):
+    """Yields (t, label, show, frame) for the scripted demo, without any lights."""
+    random.seed(seed)
+    show = Show(conf, build_room(FAKE_ROOM, conf))
+    show.set_palette(palette_for(conf, None), 0.0)
+    if show.st.get("green"):
+        show.zl = {k: list(v) for k, v in FAKE_ZONES.items()}
+    step, t, label, dt = 0, 0.0, "explore", 1 / fps
+    names = {1: "cast", 2: "KILL", 3: "hit taken", 4: "heal", 5: "LEVEL UP", 6: "reward",
+             7: "target"}
+    while t < secs:
+        el = t * 75 / secs
+        while step < len(DEMO) and DEMO[step][0] <= el:
+            act = DEMO[step][1]
+            step += 1
+            if act[0] == "state":
+                show.set_state(t, **{**{k: False for k in show.state}, **act[1]})
+                label = show.mode
+            elif act[0] == "ev":
+                show.event(act[1], act[2], t)
+                label = f"{show.mode} + {names[act[1]]}{' (cooldown)' if act[1:] == (1, 1) else ''}"
+            elif act[0] == "hp":
+                show.hp = act[1]
+                label = f"{show.mode}, health {int(act[1] * 100)}%"
+            elif act[0] == "zone":
+                show.set_palette(palette_for(conf, act[1]), t)
+                label = f"zone: {act[1]} -> {show.pal_name}"
+        yield t, label, show, show.render(t, dt)
+        t += dt
+
+
+def preview(conf, secs):
+    sys.stdout.write("\x1b[2J\x1b[?25l")
+    try:
+        start = time.time()
+        for t, label, show, frame in demo_frames(conf, secs):
+            draw(frame_devs(show, frame),
+                 f"PREVIEW  style: {style_name(conf)}  {t:4.1f}s  {label}")
+            time.sleep(max(0.0, start + t - time.time()))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\x1b[0m\x1b[?25h\n")
+
+
+def watch():
+    sys.stdout.write("\x1b[2J\x1b[?25l")
+    try:
+        while True:
+            try:
+                d = json.loads(FRAMEFILE.read_text())
+                fresh = time.time() - d["t"] < 2
+            except (OSError, ValueError, KeyError):
+                d, fresh = None, False
+            if fresh:
+                draw(d["devs"], f"LIVE  {d['status']}")
+            else:
+                sys.stdout.write("\x1b[H\x1b[0mwaiting for a light session (start WoW or "
+                                 "`govee-wow demo`)...      ")
+                sys.stdout.flush()
+            time.sleep(1 / 20)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\x1b[0m\x1b[?25h\n")
+
+
+def luminance(c):
+    return 0.2126 * _lin(c[0]) + 0.7152 * _lin(c[1]) + 0.0722 * _lin(c[2])
+
+
+def flash_report(conf, secs=75.0, fps=30):
+    """WCAG 2.3.1-style analysis per light: a flash = a pair of opposing luminance changes of
+    >= 10% where the darker state is < 0.80; red flash = the same involving saturated red.
+    Also reports the fastest brightness change (how 'punchy' it feels)."""
+    series, peak, blue = {}, 0.0, 0.0
+    dimmer = level_cap(conf)
+    for t, _l, show, frame in demo_frames(conf, secs, fps):
+        for k, (kind, cols) in enumerate(frame_devs(show, frame)):
+            peak = max(peak, dimmer * max(max(c) for c in cols))
+            blue = max(blue, max(c[2] for c in cols))
+            y = sum(luminance(c) for c in cols) / len(cols)
+            red = sum(1 for c in cols if c[0] > 0.5 and c[0] > 4 * max(c[1], c[2])) / len(cols)
+            series.setdefault(k, []).append((t, y, red))
+    worst = {"flash": 0.0, "red": 0.0, "jump": 0.0, "peak": peak, "blue": blue}
+    for pts in series.values():
+        trans, rtrans = [], []
+        ext, d = pts[0][1], 0             # running extreme, confirmed direction (+1 / -1)
+        for i, (t, y, red) in enumerate(pts):
+            if i:
+                worst["jump"] = max(worst["jump"], abs(y - pts[i - 1][1]) * fps)
+            if (d >= 0 and y > ext) or (d <= 0 and y < ext):
+                ext = y if d != 0 else ext
+            if d == 0 and abs(y - ext) < 0.10:
+                continue
+            nd = 1 if y > ext else -1
+            if nd != d and abs(y - ext) >= 0.10 and min(y, ext) < 0.80:
+                trans.append(t)                # a confirmed reversal = one transition
+                if red > 0.3:
+                    rtrans.append(t)
+                d, ext = nd, y
+        for name, tr in (("flash", trans), ("red", rtrans)):
+            for i, t in enumerate(tr):
+                n = sum(1 for u in tr[i:] if u - t < 1.0)
+                worst[name] = max(worst[name], n / 2)
+    return worst
+
+
+def check(conf):
+    print("Safety check over the full 75 s demo (combat, boss, low health, finales), per light.")
+    print("Guideline (WCAG 2.3.1): no more than 3 flashes in any 1 second; red flashes count too.")
+    print(f"{'style':10} {'flashes/s':>10} {'red flashes/s':>14} {'fastest change':>16} "
+          f"{'peak':>6} {'blue':>5}   verdict")
+    for name in STYLES:
+        r = flash_report({**conf, "style": name, "night_style": "", "schedule": []})
+        ok = r["flash"] <= 3 and r["red"] <= 3
+        calm = r["flash"] <= 1 and r["jump"] <= 2
+        verdict = "calm" if calm else "within guideline" if ok else "TOO FLASHY"
+        mark = "  <- now" if name == style_name(conf) else ""
+        print(f"{name:10} {r['flash']:>10.1f} {r['red']:>14.1f} {r['jump']:>13.1f}/s "
+              f"{r['peak']:>5.0f}% {r['blue'] * 100:>4.0f}%   {verdict}{mark}")
+    print("fastest change = share of full brightness per second (1.0/s = dark to full in 1 s)")
+    print("peak = brightest any light gets (% of its maximum); blue = most blue in any color")
+
+
+# ---- daemon / demo ---------------------------------------------------------------------
+def write_status(text):
+    try:
+        STATUS.write_text(text + "\n")
+    except OSError:
+        pass
+
+
+def should_run(conf):
+    when = conf.get("when", "couch")
+    if when == "never":
+        return False
+    if when == "couch":
+        try:
+            if PROFILE.read_text().strip() != "couch":
+                return False
+        except OSError:
+            return False
+    return proc_running(b"Wow.exe")
+
+
+DEMO = [  # (second, action) for a 75 s run; scaled to other lengths
+    (0, ("state", {})), (1, ("ev", 7, 0)), (6, ("zone", "Burning Steppes")),
+    (9, ("state", {"mounted": True})), (16, ("state", {"mounted": False})),
+    (17, ("ev", 7, 0)), (18, ("state", {"combat": True})),
+    (19, ("ev", 1, 0)), (20, ("ev", 1, 0)), (20.7, ("ev", 3, 3)), (21.3, ("ev", 1, 0)),
+    (22, ("ev", 1, 0)), (23, ("ev", 1, 1)), (25, ("ev", 1, 0)), (25.6, ("ev", 1, 0)),
+    (26.2, ("ev", 1, 0)), (27, ("ev", 2, 0)), (28.5, ("ev", 3, 5)), (29, ("hp", 0.3)),
+    (30, ("ev", 3, 4)), (31, ("hp", 0.15)), (33, ("ev", 4, 6)), (33.2, ("hp", 0.7)),
+    (34, ("ev", 2, 0)), (35, ("state", {"combat": False})), (35.1, ("hp", 1.0)),
+    (37, ("state", {"boss": True, "combat": True})), (38, ("ev", 1, 0)), (39, ("ev", 1, 1)),
+    (41, ("ev", 1, 0)), (42, ("ev", 1, 0)), (44, ("ev", 3, 6)), (45, ("ev", 1, 0)),
+    (48, ("state", {"boss": False, "combat": False})), (48.1, ("ev", 6, 7)),
+    (54, ("ev", 6, 0)), (56, ("state", {"resting": True})), (61, ("state", {"resting": False})),
+    (62, ("state", {"dead": True})), (67, ("state", {"dead": False})), (68, ("ev", 5, 0)),
+]
+
+
+def session(conf, until=None, demo=False):
+    """Run one lighting session until WoW exits (or the demo ends)."""
+    lights = Lights()
+    lights.discover()
+    if not lights.devices:
+        write_status("no Govee lights found (LAN Control on?)")
+        lights.close()
+        return
+    show = Show(conf, build_room(lights.devices, conf))
+    lights.begin(level_cap(conf))
+    screen, bridge = Screen(), Bridge()
+    if conf.get("screen", True) and not screen.start():
+        write_status(f"screen off: {screen.error}")
+    logst = LogState(conf)
+    log, fh = newest_log(), None
+    if log and not demo:
+        fh = open(log, "r", errors="replace")
+        fh.seek(0, os.SEEK_END)
+    last, last_check, t0, step = time.time(), 0.0, time.time(), 0
+    log_combat_was = False
+    last_dump = 0.0
+    try:
+        while True:
+            now = time.time()
+            dt = min(0.2, now - last)
+            last = now
+            if demo:
+                el = (now - t0) * 75 / max(1.0, until - t0)
+                while step < len(DEMO) and DEMO[step][0] <= el:
+                    act = DEMO[step][1]
+                    step += 1
+                    if act[0] == "state":
+                        show.set_state(now, **{**{k: False for k in show.state}, **act[1]})
+                    elif act[0] == "ev":
+                        show.event(act[1], act[2], now)
+                    elif act[0] == "hp":
+                        show.hp = act[1]
+                    elif act[0] == "zone":
+                        logst.zone = act[1]
+                if now >= until:
+                    break
+            else:
+                if now - last_check > 2.0:
+                    last_check = now
+                    live_conf = load_conf()
+                    if not should_run(live_conf):
+                        break
+                    name = style_name(live_conf)
+                    if STYLES[name] is not show.st:      # the schedule moved on: switch live
+                        conf = live_conf
+                        show.apply_style(conf, name)
+                        for ip in lights.devices:
+                            lights.send(ip, "brightness", {"value": level_cap(conf)})
+                            time.sleep(0.2)
+                    newest = newest_log()
+                    if newest and newest != log:
+                        if fh:
+                            fh.close()
+                        log, fh = newest, open(newest, "r", errors="replace")
+                if fh:
+                    for line in fh.readlines():
+                        logst.feed(line, now)
+                vals = bridge.decode(screen.strip(), now) if screen.bridge else None
+                if vals:
+                    s1, s2, hp, code, detail, seq = vals
+                    show.set_state(now, combat=bool(s1 & 1), boss=bool(s1 & 2),
+                                   dead=bool(s1 & 4), mounted=bool(s2 & 1),
+                                   resting=bool(s2 & 2), instance=bool(s2 & 4))
+                    show.hp = (hp + 0.5) / 8 if hp < 7 else 1.0
+                    if bridge.seq is not None and seq != bridge.seq and code:
+                        show.event(code, detail, now)
+                    bridge.seq = seq
+                    logst.queue.clear()
+                    show.bpm_hint = None
+                elif not bridge.live(now):           # no strip: the combat log drives it
+                    combat = 0 <= logst.clock(now) - logst.last_combat < 6
+                    show.set_state(now, combat=combat or logst.boss, boss=logst.boss,
+                                   dead=logst.dead)
+                    if combat and not log_combat_was:
+                        show.event(7, 0, now)
+                    log_combat_was = combat
+                    show.bpm_hint = logst.combat_bpm()
+                    for code, detail, late in logst.due(now):
+                        if late > logst.stale_s:
+                            continue
+                        if code in logst.TRANSIENT and late > logst.late_s:
+                            show.energy = min(1.0, show.energy + 0.12)   # felt, not flashed
+                            continue
+                        show.event(code, detail, now)
+            show.set_palette(palette_for(conf, logst.zone), now)
+            frame = screen.frame()
+            if frame:
+                lab, lum = analyze(frame)
+                show.set_scene(lab, lum, now, demo or bridge.live(now))
+                if show.st.get("green"):
+                    show.set_zones(zones(frame, conf["lamp_segments"], conf["ceiling_pixels"]),
+                                   dt)
+            frame_now = show.render(now, dt)
+            lights.show(frame_now, conf, now)
+            if now - last_dump > 0.05:
+                last_dump = now
+                try:
+                    FRAMEFILE.write_text(json.dumps({"t": now, "status": STATUS.read_text().strip()
+                                                     if STATUS.exists() else "",
+                                                     "devs": frame_devs(show, frame_now)}))
+                except OSError:
+                    pass
+            src = "demo" if demo else "live" if bridge.live(now) else "combat log"
+            if src == "combat log":
+                src += f" (lag-compensated {logst.delay:.1f}s)"
+            write_status(f"{show.mode} · {show.pal_name} · {len(lights.devices)} lights · "
+                         f"{src}{'' if screen.sink else ' · no screen'}")
+            time.sleep(max(0.0, 1.0 / conf["stream_hz"] - (time.time() - now)))
+    finally:
+        screen.stop()
+        lights.end()
+        lights.close()
+        if fh:
+            fh.close()
+
+
+def daemon():
+    write_status("waiting for WoW")
+    while True:
+        conf = load_conf()
+        if should_run(conf):
+            session(conf)
+            write_status("waiting for WoW · lights restored")
+        time.sleep(2)
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if arg == "daemon":
+        daemon()
+    elif arg == "demo":
+        secs = int(sys.argv[2]) if len(sys.argv) > 2 else 75
+        conf = load_conf()
+        if len(sys.argv) > 3 and sys.argv[3] in STYLES:
+            conf["style"], conf["night_style"], conf["schedule"] = sys.argv[3], "", []
+        print(f"{secs}s show: explore → mounted → combat (casts, hits, kill, cooldown, low "
+              "health, heal) → boss → boss kill finale → lounge → death → level up")
+        session(conf, until=time.time() + secs, demo=True)
+        write_status("waiting for WoW · lights restored")
+        print("done — lights restored")
+    elif arg == "preview":
+        conf = load_conf()
+        if len(sys.argv) > 3 and sys.argv[3] in STYLES:
+            conf["style"], conf["night_style"], conf["schedule"] = sys.argv[3], "", []
+        preview(conf, float(sys.argv[2]) if len(sys.argv) > 2 else 75.0)
+    elif arg == "watch":
+        watch()
+    elif arg == "check":
+        check(load_conf())
+    elif arg == "afterdark" and len(sys.argv) > 3 and sys.argv[2] == "level" \
+            and sys.argv[3].isdigit() and 1 <= int(sys.argv[3]) <= 10:
+        load_conf()
+        save_key("afterdark_level", int(sys.argv[3]))
+        print(f"after dark brightness: {sys.argv[3]}% (next session / demo)")
+    elif arg == "afterdark" and len(sys.argv) > 2 and sys.argv[2] in ("auto", "off"):
+        conf = load_conf()
+        save_key("night_style", "afterdark" if sys.argv[2] == "auto" else "")
+        print("after dark: " + (f"automatic {conf['night_from']}:00-{conf['night_to']}:00"
+                                if sys.argv[2] == "auto" else "off"))
+    elif arg == "style" and len(sys.argv) > 2 and sys.argv[2] in STYLES:
+        load_conf()
+        save_key("style", sys.argv[2])
+        print(f"style: {sys.argv[2]} (applies from the next session)")
+    elif arg == "palette" and len(sys.argv) > 2 and (sys.argv[2] == "auto"
+                                                     or sys.argv[2] in PALETTES):
+        load_conf()
+        save_key("palette", sys.argv[2])
+        print(f"palette: {sys.argv[2]}")
+    elif arg == "level" and len(sys.argv) > 2 and sys.argv[2].isdigit() \
+            and 10 <= int(sys.argv[2]) <= 100:
+        load_conf()
+        save_key("level", int(sys.argv[2]))
+        print(f"brightness: {sys.argv[2]}% (applies from the next session)")
+    elif arg == "when" and len(sys.argv) > 2 and sys.argv[2] in ("couch", "always", "never"):
+        load_conf()
+        save_key("when", sys.argv[2])
+        print(f"lights react to WoW: {sys.argv[2]}")
+    elif arg == "status":
+        conf = load_conf()
+        try:
+            st = STATUS.read_text().strip()
+        except OSError:
+            st = "service not running"
+        print(f"💡 govee-wow: {st}  (when: {conf['when']}, style: {style_name(conf)}, "
+              f"palette: {conf['palette']}, level: {conf['level']}%)")
+    else:
+        print(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main()

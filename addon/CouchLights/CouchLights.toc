@@ -1,0 +1,7 @@
+## Interface: 16001
+## Title: CouchLights
+## Notes: Real-time game state for the room lights (govee-wow): a tiny 8-pixel color strip in the top-left corner that the light engine reads from the screen.
+## Author: GrayManSam
+## Version: 1.0
+## SavedVariables: CouchLightsDB
+CouchLights.lua

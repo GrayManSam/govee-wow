@@ -1,0 +1,67 @@
+{
+  "version": 4,
+  "when": "couch",
+  "style": "comfort",
+  "night_style": "",
+  "afterdark_level": 2,
+  "schedule": [
+    [
+      23,
+      7,
+      "afterdark"
+    ],
+    [
+      7,
+      18,
+      "daylight"
+    ],
+    [
+      19,
+      20,
+      "party"
+    ]
+  ],
+  "terrain_tint": 0.55,
+  "schedule_default": "standard",
+  "palette": "auto",
+  "level": 100,
+  "night_scale": 1.0,
+  "night_from": 23,
+  "night_to": 7,
+  "program_level": {
+    "explore": 0.62,
+    "lounge": 0.5,
+    "cruise": 0.7,
+    "combat": 0.8,
+    "boss": 0.9,
+    "dead": 0.14
+  },
+  "bpm": {
+    "explore": 96,
+    "lounge": 84,
+    "cruise": 120,
+    "combat": 128,
+    "boss": 140,
+    "dead": 30
+  },
+  "drones": 3,
+  "low_health": 0.35,
+  "max_flashes_per_s": 3,
+  "screen": true,
+  "screen_tint": 0.25,
+  "screen_flashes": true,
+  "room": [],
+  "lamp_segments": 15,
+  "lamp_bottom_first": true,
+  "lamp_hz": 12,
+  "ceiling_pixels": 12,
+  "stream_hz": 30,
+  "hunter_cooldowns": [
+    "Bestial Wrath",
+    "Trueshot",
+    "Coordinated Assault",
+    "Aspect of the Wild",
+    "Call of the Wild",
+    "Rapid Fire"
+  ]
+}

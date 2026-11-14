@@ -1,0 +1,167 @@
+#!/usr/bin/python3 -I
+"""govee-wow-test - checks the WoW light show without needing WoW.
+
+  govee-wow-test                 offline tests only (lights untouched)
+  govee-wow-test --live          + a short demo on the real lights in the style for right now
+  govee-wow-test --live STYLE    + a short demo in that style (comfort/standard/party/afterdark/daylight)
+
+Tests:
+  1. govee-wow compiles and its config loads
+  2. schedule: style + brightness for every hour of the day, and the TV-only rule
+  3. safety: flashes/s, red flashes, peak brightness and blue per style (WCAG 2.3.1)
+  4. after dark: never above its cap, never any blue
+  5. CouchLights strip decoding (full screen and windowed)
+  6. combat log lag compensation, replaying your newest real combat log
+  7. CouchLights / CouchUI addons compile (luajit)
+"""
+import os
+import importlib.util
+import json
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+GW = Path.home() / ".local/bin/govee-wow"
+ADDONS = Path(os.environ.get("WOW_DIR") or Path.home() / "Games/battlenet/drive_c/Program Files (x86)/World of Warcraft/_forever_") / "Interface/AddOns"
+results = []
+
+
+def check(name, ok, detail=""):
+    results.append(ok)
+    print(f"  {'PASS' if ok else 'FAIL'}  {name}{'  - ' + detail if detail else ''}")
+
+
+def load_engine():
+    # load a copy so this test never changes the running service's file
+    tmp = Path(tempfile.mkdtemp()) / "gw.py"
+    shutil.copy(GW, tmp)
+    spec = importlib.util.spec_from_file_location("gw", tmp)
+    gw = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gw)
+    return gw
+
+
+def at_hour(gw, conf, h):
+    real = time.localtime
+    time.localtime = lambda *a: time.struct_time((2026, 1, 1, h, 0, 0, 3, 1, 0))
+    try:
+        return gw.style_name(conf), gw.level_cap(conf)
+    finally:
+        time.localtime = real
+
+
+def main():
+    live = "--live" in sys.argv
+    pick = next((a for a in sys.argv[1:] if not a.startswith("--")), None)
+
+    print("1. engine")
+    try:
+        gw = load_engine()
+        conf = gw.load_conf()
+        check("govee-wow loads", True, f"when={conf['when']}, schedule={conf.get('schedule')}")
+    except Exception as e:                                   # noqa: BLE001
+        check("govee-wow loads", False, repr(e))
+        return finish()
+
+    print("2. schedule")
+    want = {**{h: "afterdark" for h in list(range(23, 24)) + list(range(0, 7))},
+            **{h: "daylight" for h in range(7, 18)}, 18: "standard", 19: "party", 20: "standard",
+            21: "standard", 22: "standard"}
+    table = {h: at_hour(gw, conf, h) for h in range(24)}
+    bad = [f"{h}:00 is {table[h][0]}, want {want[h]}" for h in range(24) if table[h][0] != want[h]]
+    check("every hour has the right style", not bad, "; ".join(bad))
+    print("      " + "  ".join(f"{h:02d} {s[:5]} {lvl}%" for h, (s, lvl) in table.items()))
+    check("lights only with the TV (when = couch)", conf["when"] == "couch", conf["when"])
+    now = gw.style_name(conf)
+    print(f"      right now: {now} at {gw.level_cap(conf)}% dimmer")
+
+    print("3. safety (75 s scripted show per style)")
+    for name in gw.STYLES:
+        r = gw.flash_report({**conf, "style": name, "night_style": "", "schedule": []})
+        ok = r["flash"] <= 3 and r["red"] <= 3
+        check(f"{name:9} within WCAG 2.3.1", ok,
+              f"{r['flash']:.1f} flashes/s, {r['red']:.1f} red/s, peak {r['peak']:.0f}%, "
+              f"blue {r['blue'] * 100:.0f}%, fastest change {r['jump']:.1f}/s")
+
+    print("4. after dark")
+    ad = {**conf, "style": "afterdark", "night_style": "", "schedule": []}
+    r = gw.flash_report(ad)
+    cap = gw.level_cap(ad)
+    check("never above its cap", r["peak"] <= cap + 0.01, f"peak {r['peak']:.1f}% (cap {cap}%)")
+    check("never any blue", r["blue"] == 0, f"max blue {r['blue']:.3f}")
+    check("cap is 10% or less", cap <= 10, f"{cap}%")
+
+    print("5. CouchLights strip decoding")
+
+    def strip(vals, ox=0, oy=0, p=8, w=200, h=80):
+        buf = bytearray(bytes((30, 60, 40)) * (w * h))
+        for k, v in enumerate([5] + vals + [6]):
+            rgb = bytes((255 * (v & 1), 255 * (v >> 1 & 1), 255 * (v >> 2 & 1)))
+            for y in range(oy, oy + p):
+                for x in range(ox + k * p, ox + k * p + p):
+                    buf[(y * w + x) * 3:(y * w + x) * 3 + 3] = rgb
+        return w, h, w * 3, bytes(buf)
+    for label, args in (("full screen", {}), ("windowed, offset + smaller", {"ox": 12, "oy": 33,
+                                                                              "p": 6})):
+        vals = [random.randrange(8) for _ in range(6)]
+        got = gw.Bridge().decode(strip(vals, **args), 1.0)
+        check(f"decodes {label}", got == vals, f"sent {vals}, read {got}")
+    check("ignores a screen with no strip", gw.Bridge().decode((200, 80, 600, bytes(48000)), 1.0)
+          is None)
+
+    print("6. combat log lag compensation")
+    log = gw.newest_log()
+    lines = []
+    if log:
+        lines = [ln for ln in open(log, errors="replace") if "  " in ln][:20000]
+    if len(lines) < 50:
+        print("      skipped: no combat log with enough lines yet")
+    else:
+        st = gw.LogState(conf)
+        ts = [gw.log_time(ln.split("  ", 1)[0]) for ln in lines]
+        t, i, flush, played = ts[0], 0, ts[0] + 1.5, []
+        while t < ts[-1] + 5:
+            if t >= flush:                     # the game writes the file in bursts
+                while i < len(lines) and ts[i] <= flush:
+                    st.feed(lines[i], t)
+                    i += 1
+                flush += random.uniform(1.0, 2.5)
+            played += [late for _c, _d, late in st.due(t)]
+            t += 1 / 30
+        on_time = sum(1 for x in played if x <= st.late_s) / max(1, len(played))
+        check("cues replay in rhythm despite 1-2.5 s bursts", on_time >= 0.85,
+              f"{on_time:.0%} within {st.late_s}s, {len(played)} cues, delay {st.delay:.2f}s "
+              f"({log.name})")
+
+    print("7. addons")
+    if shutil.which("luajit"):
+        for f in ("CouchLights/CouchLights.lua", "CouchUI/CouchUI.lua"):
+            path = ADDONS / f
+            if not path.exists():
+                check(f"{f} exists", False)
+                continue
+            r = subprocess.run(["luajit", "-bl", str(path)], capture_output=True, text=True)
+            check(f"{f} compiles", r.returncode == 0, r.stderr.strip()[:120])
+    else:
+        print("      skipped: luajit not installed")
+
+    if live:
+        style = pick if pick in gw.STYLES else now
+        print(f"8. live: 20 s demo on the real lights, style {style} (lights restore after)")
+        r = subprocess.run([str(GW), "demo", "20", style])
+        check("live demo ran and restored the lights", r.returncode == 0)
+    return finish()
+
+
+def finish():
+    passed = sum(results)
+    print(f"\n{passed}/{len(results)} passed" + ("" if passed == len(results) else "  <- see FAIL"))
+    return 0 if passed == len(results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
