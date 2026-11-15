@@ -56,6 +56,9 @@ flashes counted separately). `govee-wow check` prints the analysis for every sty
    top-left corner of the screen. govee-wow reads it from a screen capture (GNOME
    Mutter ScreenCast + PipeWire), so it knows combat / boss / dead / mounted / resting / health
    and the last event within ~0.1 s. The same capture provides the picture for the colors.
+   The strip also carries one non-light event: CouchUI's guild **Recruit** (cast, detail 7),
+   on which govee-wow types `/ginvite` into the game (WoW Forever only accepts typed guild
+   invites; see [wow-couch](https://github.com/GrayManSam/wow-couch)).
 2. **Combat log (fallback).** Without the strip, it tails `Logs/WoWCombatLog*.txt` (run
    `/combatlog` in game). The log is written in bursts 1–3 s late, so cues are replayed through
    a jitter buffer, and cues that arrive too late become "energy" instead of flashes.

@@ -9,6 +9,15 @@
 --   cell 1  combat | boss | dead        cell 5  event detail (0-7)
 --   cell 2  mounted | resting | instance cell 6  event counter (0-7, new event = changed)
 --   cell 3  health 0-7 (7 = full)       cell 7  end marker (cyan)
+--   ghost = dead + mounted together (a ghost can't be mounted)
+--   cast detail: 1 big cooldown, 2 gathering (skinning...), 3 melee strike
+--   reward detail: 0 quest, 1 achievement, 2 loot window, 3/4/5 uncommon/rare/epic item,
+--                  6 whisper, 7 boss kill
+--   target detail: 0 normal, 1 elite, 2 rare, 3 world boss
+--
+-- Row 2 (directly below, same cell size): yellow | A | B | C | D | E | version | yellow
+--   A  swimming | indoors | feign death or stealth     C  target class 0-4 (0 = none)
+--   B  pet alive | pet dead | on a taxi                D  target health 0-7   E  power 0-7
 --
 -- /lights        status          /lights off|on     hide/show the strip (lights go calm)
 
@@ -19,6 +28,10 @@ local BIG = {   -- big cooldowns: detail 1 = power-up show
     ["Aspect of the Wild"] = true, ["Call of the Wild"] = true, ["Rapid Fire"] = true,
     ["Bloodlust"] = true, ["Heroism"] = true, ["Primal Rage"] = true, ["Time Warp"] = true,
 }
+local GATHER = { ["Skinning"] = true, ["Mining"] = true, ["Herb Gathering"] = true,
+    ["Fishing"] = true, ["Disenchant"] = true, ["Smelting"] = true }
+local MELEE = { ["Raptor Strike"] = true, ["Mongoose Bite"] = true, ["Wing Clip"] = true,
+    ["Counterattack"] = true }
 local IGNORE = { [75] = true }  -- Auto Shot: fires every 2-3 s by itself, not a "move"
 
 local strip = CreateFrame("Frame", "CouchLightsStrip", WorldFrame)
@@ -33,23 +46,39 @@ for i = 0, CELLS - 1 do
     cells[i] = t
 end
 
+local cells2 = {}
+for i = 0, CELLS - 1 do
+    local t = strip:CreateTexture(nil, "OVERLAY")
+    t:SetColorTexture(0, 0, 0, 1)
+    if t.SetSnapToPixelGrid then t:SetSnapToPixelGrid(false); t:SetTexelSnappingBias(0) end
+    cells2[i] = t
+end
+
 local function layout()
     -- exact physical pixels whatever the UI scale: 1 px = (768 / screen height) UI units
     local _, physH = GetPhysicalScreenSize()
     if not physH or physH <= 0 then return end
     local unit = (768 / physH) / strip:GetEffectiveScale()
     local s = CELL_PX * unit
-    strip:SetSize(s * CELLS, s)
+    strip:SetSize(s * CELLS, s * 2)
     for i = 0, CELLS - 1 do
         cells[i]:ClearAllPoints()
         cells[i]:SetPoint("TOPLEFT", strip, "TOPLEFT", i * s, 0)
         cells[i]:SetSize(s, s)
+        cells2[i]:ClearAllPoints()
+        cells2[i]:SetPoint("TOPLEFT", strip, "TOPLEFT", i * s, -s)
+        cells2[i]:SetSize(s, s)
     end
 end
 
 local function put(i, v)
     cells[i]:SetColorTexture(bit.band(v, 1) > 0 and 1 or 0, bit.band(v, 2) > 0 and 1 or 0,
                              bit.band(v, 4) > 0 and 1 or 0, 1)
+end
+
+local function put2(i, v)
+    cells2[i]:SetColorTexture(bit.band(v, 1) > 0 and 1 or 0, bit.band(v, 2) > 0 and 1 or 0,
+                              bit.band(v, 4) > 0 and 1 or 0, 1)
 end
 
 local function secret(v) return issecretvalue and issecretvalue(v) end
@@ -69,6 +98,36 @@ local function flag(fn, ...)
     return v and true or false
 end
 
+local CLASS = { normal = 1, trivial = 1, minus = 1, elite = 2, rare = 3, rareelite = 3,
+    worldboss = 4 }
+local function targetClass()
+    if not flag(UnitCanAttack, "player", "target") or flag(UnitIsDead, "target") then return 0 end
+    local ok, v = pcall(UnitClassification, "target")
+    if not ok or secret(v) then return 1 end
+    return CLASS[v] or 1
+end
+
+local function frac8(cur, max, unit)
+    local ok, v = pcall(function()
+        local h, m = cur(unit), max(unit)
+        if secret(h) or secret(m) or not m or m <= 0 then return nil end
+        return math.min(7, math.floor(h / m * 8))
+    end)
+    return ok and v or 7
+end
+
+local function extBits()
+    local c1 = (flag(IsSwimming) and 1 or 0) + (flag(IsIndoors) and 2 or 0)
+        + ((flag(UnitIsFeignDeath, "player") or flag(IsStealthed)) and 4 or 0)
+    local pet = flag(UnitExists, "pet")
+    local petDead = pet and flag(UnitIsDead, "pet")
+    local c2 = ((pet and not petDead) and 1 or 0) + (petDead and 2 or 0)
+        + (flag(UnitOnTaxi, "player") and 4 or 0)
+    local tc = targetClass()
+    return c1, c2, tc, tc > 0 and frac8(UnitHealth, UnitHealthMax, "target") or 7,
+        frac8(UnitPower, UnitPowerMax, "player")
+end
+
 -- ---- state -------------------------------------------------------------------------------
 local inCombat, inBoss, queue, seq, showing, showUntil = false, false, {}, 0, nil, 0
 local lastHP, targetGUID, targetDead = nil, nil, false
@@ -83,11 +142,17 @@ local function emit(code, detail)
     table.insert(queue, { code, detail or 0 })
 end
 
+-- (CouchUI Recruit) the guild invite has to be typed for real: govee-wow sees this on the
+-- strip (cast, detail 7 - casts only use 0-3) and types "/ginvite" + Enter into the game.
+function CouchLights_Recruit() emit(EV.cast, 7) end
+
 local function stateBits()
     local dead = flag(UnitIsDeadOrGhost, "player")
     local a = (inCombat and 1 or 0) + (inBoss and 2 or 0) + (dead and 4 or 0)
     local inst = flag(IsInInstance)
-    local b = (flag(IsMounted) and 1 or 0) + (flag(IsResting) and 2 or 0) + (inst and 4 or 0)
+    local ghost = dead and flag(UnitIsGhost, "player")
+    local b = ((ghost or (not dead and flag(IsMounted))) and 1 or 0)
+        + (flag(IsResting) and 2 or 0) + (inst and 4 or 0)
     local hp = healthFrac()
     return a, b, hp and math.min(7, math.floor(hp * 8)) or 7, hp
 end
@@ -129,6 +194,8 @@ strip:SetScript("OnUpdate", function(_, dt)
     put(4, showing and showing[1] or 0)
     put(5, showing and showing[2] or 0)
     put(6, seq)
+    local ok, c1, c2, tc, thp, pw = pcall(extBits)
+    if ok then put2(1, c1); put2(2, c2); put2(3, tc); put2(4, thp); put2(5, pw) end
 end)
 
 local f = CreateFrame("Frame")
@@ -143,11 +210,15 @@ f:RegisterEvent("PLAYER_LEVEL_UP")
 f:RegisterEvent("QUEST_TURNED_IN")
 f:RegisterEvent("ACHIEVEMENT_EARNED")
 f:RegisterEvent("PLAYER_TARGET_CHANGED")
+f:RegisterEvent("LOOT_OPENED")
+f:RegisterEvent("CHAT_MSG_LOOT")
+f:RegisterEvent("CHAT_MSG_WHISPER")
 f:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
 f:SetScript("OnEvent", function(_, event, ...)
     if event == "PLAYER_LOGIN" then
         CouchLightsDB = CouchLightsDB or {}
         put(0, 5); put(7, 6)                      -- magenta start, cyan end
+        put2(0, 3); put2(6, 1); put2(7, 3)        -- row 2: yellow markers, version 1
         layout()
         strip:SetShown(CouchLightsDB.off ~= true)
     elseif event == "DISPLAY_SIZE_CHANGED" or event == "UI_SCALE_CHANGED" then
@@ -162,17 +233,31 @@ f:SetScript("OnEvent", function(_, event, ...)
     elseif event == "PLAYER_LEVEL_UP" then emit(EV.levelup)
     elseif event == "QUEST_TURNED_IN" then emit(EV.reward, 0)
     elseif event == "ACHIEVEMENT_EARNED" then emit(EV.reward, 1)
+    elseif event == "LOOT_OPENED" then emit(EV.reward, 2)
     elseif event == "PLAYER_TARGET_CHANGED" then
-        if flag(UnitCanAttack, "player", "target") and not flag(UnitIsDead, "target") then
-            emit(EV.target)
-        end
+        local tc = targetClass()
+        if tc > 0 then emit(EV.target, tc - 1) end
+    elseif event == "CHAT_MSG_WHISPER" then emit(EV.reward, 6)
+    elseif event == "CHAT_MSG_LOOT" then
+        local msg = ...
+        if secret(msg) or type(msg) ~= "string" then return end
+        local ok, q = pcall(function()
+            if not msg:find("^You receive") and not msg:find("^You create") then return nil end
+            local n = msg:match("|cnIQ(%d)")
+            if n then return tonumber(n) end
+            local hex = msg:match("|c%x%x(%x%x%x%x%x%x)")
+            hex = hex and hex:lower()
+            return hex == "1eff00" and 2 or hex == "0070dd" and 3 or hex == "a335ee" and 4
+                or hex == "ff8000" and 5 or nil
+        end)
+        if ok and q and q >= 2 then emit(EV.reward, math.min(5, q + 1)) end
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         local _, _, spellID = ...
         if secret(spellID) or IGNORE[spellID] then return end
         local name
         pcall(function() name = C_Spell.GetSpellName(spellID) end)
         if secret(name) then name = nil end
-        emit(EV.cast, (name and BIG[name]) and 1 or 0)
+        emit(EV.cast, name and (BIG[name] and 1 or GATHER[name] and 2 or MELEE[name] and 3) or 0)
     end
 end)
 

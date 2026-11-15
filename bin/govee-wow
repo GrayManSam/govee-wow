@@ -9,9 +9,12 @@
   govee-wow palette NAME    auto (by zone) | club | velvet | midnight | neon
   govee-wow level N         master brightness 10-100 (default 100), on top of the style caps
   govee-wow max [STYLE N]   per-style brightness cap in % (what the lights may reach at most):
-                            daylight 60, party 55, standard 50, comfort 45, afterdark 2 (1-10)
-  govee-wow style NAME      comfort | standard | party | afterdark | daylight
-  (schedule in config.json: 23-7 afterdark, 7-18 daylight, 19-20 party, else standard)
+                            daylight 60, party 55, standard 50, comfort 45, evening 10,
+                            afterdark 2 (1-10)
+  govee-wow style NAME      comfort | standard | party | afterdark | daylight | evening
+  (schedule in config.json: 7-18 daylight, 18-23 evening, 23-7 afterdark)
+  evening  = the daylight look for a dark room: deep emerald / pine / teal, moonlight
+             instead of sun, much dimmer, no flashes, slow gentle changes only
   daylight = greens matched to the game's terrain: ceiling = sky/canopy, lamps = ground
              rising into foliage, wind + sun dapples, sun arc teal morning -> gold evening
   govee-wow afterdark auto  switch to afterdark automatically at night (23:00-07:00); off
@@ -19,6 +22,7 @@
   govee-wow preview [s] [style]   emulator: draws the show in this terminal, lights untouched
   govee-wow watch           live mirror of what the real lights are doing right now
   govee-wow check           flash/photosensitivity analysis of every style (WCAG 2.3.1)
+  govee-wow music [on|off|level N|test [secs]]   the lights listen to the music (see below)
   govee-wow daemon          background service (systemd: govee-wow.service)
 
 The room is one canvas: lamp - ceiling ring - lamp. Everything is choreographed on it.
@@ -29,6 +33,14 @@ The room is one canvas: lamp - ceiling ring - lamp. Everything is choreographed 
     combat   128 BPM: kick pulses, the lamps are VU meters of your action, ceiling chase
     boss     140 BPM: purple/blue lighthouse sweeps, white-pink hits on the downbeat
     dead     blackout to deep blue, a slow flatline pulse
+    swim     the room turns to deep water;  indoors dims the world;  feign death / stealth
+             hushes the room;  pet death = a small red fall;  elite / rare target and good
+             loot = a slow colored swell from above;  whisper = two soft ceiling pulses
+    every style tells the same story: combat = ember heat climbing the lamps out of the green
+             (turning gold as your target gets low),
+             dead = lights out, embers at the floor; ghost = dim indigo mist; kill = a gold
+             band rises and leaves; skinning / gathering = dark gold fills the lamps;
+             melee hit = ember ripple; death = red sinks to the floor; revive = green dawn
     + low health: a red heartbeat that speeds up as you drop
   Cues (one-shot effects, ~0.1 s after they happen in game):
     each spell you cast  -> a pink shockwave falls from the ceiling down the lamps
@@ -38,6 +50,13 @@ The room is one canvas: lamp - ceiling ring - lamp. Everything is choreographed 
     new target           -> ceiling blip;  pulling into combat -> red "drop" wipe
     level up / boss kill -> 5 s finale;  quest / achievement -> gold shimmer
     zone change          -> palette wipe across the room
+Music: the daemon listens to the music (PipeWire: the wow_music_eq sink, i.e. the music alone,
+else everything the speakers play) with one low-rate `parec` stream and a tiny FFT, no threads.
+It adds a bounded layer on top of the show: the lamps are a spectrum meter (bass at the
+bottom), kicks swell the room (never more often than 2.5 / s), loudness breathes, and in fights
+the beat locks to the song's tempo. The layer only dims the show's own colors, so caps and flash
+limits still hold. It steps back for death / ghost / hidden, ducks under game cues, and with
+no music playing it is simply absent. `govee-wow music test` shows what it hears.
 Real-time data comes from the CouchLights addon (an 8-pixel strip in the top-left corner,
 read from the screen). Without it the combat log file is used (1-3 s late).
 Screen capture uses GNOME's own screencast API on the TV (no "share your screen" dialog),
@@ -111,15 +130,30 @@ COLORS = {
     "red": "#ff0010", "crimson": "#d0002a", "hotpink": "#ff1493", "magenta": "#ff00c8",
     "purple": "#8a00ff", "violet": "#5a00ff", "deepblue": "#0a1cff", "blue": "#0050ff",
     "gold": "#ffa000", "flash": "#ffb4e6", "ice": "#40a0ff", "amber": "#ff6a00",
-    "hurt": "#ff0010", "sun": "#ffd27a",
+    "hurt": "#ff0010", "sun": "#ffd27a", "leaf": "#00c040",
 }
-# Daylight recolors the same choreography into the green family (+ sunlight gold accents).
+# Daylight: green world; events use the same meanings as the evening (NIGHT_COLORS), bright:
+# ember = fight / hits, gold = kills + harvest + loot, green = heals / revive, indigo = ghost.
 DAY_COLORS = {
-    "red": "#00e040", "crimson": "#008a3a", "hotpink": "#7dff00", "magenta": "#00ffa0",
-    "purple": "#00e0a0", "violet": "#00a080", "deepblue": "#007a50", "blue": "#00b3a0",
-    "gold": "#ffc800", "flash": "#60ff30", "ice": "#00ffc0", "amber": "#a0f000",
-    "hurt": "#ff9000", "sun": "#c8ff10",
+    "red": "#ff2000", "crimson": "#c01000", "hotpink": "#ff5000", "magenta": "#e06000",
+    "purple": "#6000ff", "violet": "#7000e0", "deepblue": "#2800c0", "blue": "#0040e0",
+    "gold": "#ffb000", "flash": "#60ff30", "ice": "#00e050", "amber": "#ff7800",
+    "hurt": "#ff1000", "sun": "#c8ff10", "leaf": "#10c000",
 }
+# Evening: forest green world; every game event has its own dark, saturated hue:
+# ember red / orange = the fight and hits taken, dark gold = kills, skinning, loot,
+# green = heals and coming back to life, deep indigo = the spirit world (ghost).
+NIGHT_COLORS = {
+    "red": "#a01000", "crimson": "#700800", "hotpink": "#b03000", "magenta": "#903800",
+    "purple": "#3000a0", "violet": "#3800b0", "deepblue": "#180090", "blue": "#001880",
+    "gold": "#b07000", "flash": "#18b808", "ice": "#00a030", "amber": "#a04800",
+    "hurt": "#a00800", "sun": "#20c810", "leaf": "#0c7004",
+}
+# On the real LEDs any blue in a green reads as cyan / sky blue (seen on video), so evening
+# stays between forest yellow-green and pure green: the blue channel is ~0.
+NIGHT_HUE = (math.radians(128), math.radians(144))
+WATER_HUE = (math.radians(190), math.radians(235))     # swimming, day: aqua .. blue
+NIGHT_WATER_HUE = (math.radians(215), math.radians(250))   # swimming, evening: deep blue
 # Sun over the day (hour, OKLab tint): dewy teal morning -> bright lime noon -> golden late.
 SUN_ARC = [(7, "#00e0a0"), (10, "#30ff60"), (13, "#90ff10"), (16, "#c8e000"), (18, "#ffc000")]
 
@@ -145,16 +179,31 @@ STYLES = {
     # Daylight (7-18): the standard show recolored green; at rest the room becomes the game's
     # world - ceiling = sky / canopy overhead, lamps = ground rising into foliage behind you,
     # wind waves crossing left -> right, sun dapples drifting across the ceiling.
-    "daylight": {"flash": True, "max_flashes": 2, "speed": 0.85, "slew": 2.2, "fx": 0.8,
-                 "pulse": 0.7, "heartbeat": 0.7, "boss_hits": True, "screen_flashes": True,
+    "daylight": {"flash": False, "max_flashes": 1, "speed": 0.85, "slew": 1.2, "fx": 0.8,
+                 "pulse": 0.5, "heartbeat": 0.6, "boss_hits": False, "screen_flashes": False,
                  "green": True, "lift": 1.2, "lift_max": 0.85, "vivid": 0.9},
+    # Evening (18-23, dark room): daylight's world-matched look in deep green / teal, moonlight
+    # for sun, no full-room flashes or swells at all, cues at half strength, and a slew so low
+    # that nothing can change quickly. Its cap (MAX_LEVEL) is far below the daytime one.
+    # "ceiling" dims the big overhead light relative to the lamps; no target blips at all.
+    "evening":  {"flash": False, "max_flashes": 0, "speed": 0.6, "slew": 0.35, "fx": 0.6,
+                 "pulse": 0.2, "heartbeat": 0.3, "boss_hits": False, "screen_flashes": False,
+                 "green": True, "night": True, "sparkle": 0.4, "vivid": 0.9, "ceiling": 0.6},
     # lift raises the calm base looks a little but never above lift_max of the cap, so cues
     # keep headroom instead of clipping into white (the old 1.45 lift pinned everything at 100%)
 }
 # Brightness cap per style (% of the lights' maximum, = the Govee dimmer). Nothing the show
 # sends - base looks, flashes, cues, the ceiling stream, lamp segments - can go above it:
 # colors are 0-1 *of the cap*. Daytime is the brightest (user: 100% hurt, 60% max).
-MAX_LEVEL = {"daylight": 60, "party": 55, "standard": 50, "comfort": 45, "afterdark": 2}
+# Music layer weights per style: (kick pulse, spectrum on the lamps, loudness swell). The layer
+# only ever DIMS the show's own color by (weights x how quiet the music is right now), so the
+# brightness cap and every flash / slew guard of the show underneath still hold; the sum is the
+# deepest the music can dim anything. After dark: none.
+MUSIC_MIX = {"comfort": (0.08, 0.30, 0.10), "standard": (0.30, 0.45, 0.20),
+             "party": (0.55, 0.55, 0.30), "afterdark": (0.0, 0.0, 0.0),
+             "daylight": (0.16, 0.40, 0.15), "evening": (0.10, 0.35, 0.10)}
+MAX_LEVEL = {"daylight": 60, "party": 55, "standard": 50, "comfort": 45, "evening": 10,
+             "afterdark": 2}
 
 
 def style_name(conf):
@@ -201,9 +250,9 @@ DEFAULTS = {
     "night_style": "",
     "afterdark_level": 2,         # after-dark dimmer % (1-10)
     # Style by time of day: [from_hour, to_hour, style]; hours not listed use schedule_default.
-    "schedule": [[23, 7, "afterdark"], [7, 19, "daylight"], [19, 20, "party"]],
+    "schedule": [[23, 7, "afterdark"], [7, 18, "daylight"], [18, 23, "evening"]],
     "terrain_tint": 0.55,         # daylight: how much the game's terrain colors drive the room
-    "schedule_default": "standard",            # e.g. "afterdark": used automatically night_from..night_to
+    "schedule_default": "evening",            # e.g. "afterdark": used automatically night_from..night_to
     "palette": "auto",
     "level": 100,                 # master brightness %, on top of the per-style caps
     "max_level": dict(MAX_LEVEL),  # brightness cap per style in % (govee-wow max STYLE N);
@@ -212,8 +261,9 @@ DEFAULTS = {
     "night_from": 23, "night_to": 7,
     # base brightness of each program (0-1, on top of "level")
     "program_level": {"explore": 0.62, "lounge": 0.5, "cruise": 0.7, "combat": 0.8,
-                      "boss": 0.9, "dead": 0.14},
-    "bpm": {"explore": 96, "lounge": 84, "cruise": 120, "combat": 128, "boss": 140, "dead": 30},
+                      "boss": 0.9, "dead": 0.14, "ghost": 0.5, "swim": 0.55},
+    "bpm": {"explore": 96, "lounge": 84, "cruise": 120, "combat": 128, "boss": 140, "dead": 30,
+            "ghost": 40, "swim": 70},
     "drones": 3,                  # glowing points gliding through the room in explore mode
     "low_health": 0.35,           # heartbeat below this health
     "max_flashes_per_s": 3,       # photosensitivity guard for full-room flashes
@@ -227,6 +277,10 @@ DEFAULTS = {
     "capture_delay": 5,           # seconds the WoW window must be up before capture starts
     "screen_tint": 0.25,          # how much the game picture tints the explore palette
     "screen_flashes": True,       # sudden bright frames (explosions, lightning) flash the room
+    "music": True,                # the lights listen to the music (govee-wow music off / on)
+    "music_level": 1.0,           # how much the music moves the lights (0-1.5, govee-wow music level N)
+    "music_source": "auto",       # auto = the wow_music_eq sink (music only), else the speakers
+    "music_lead_ms": 40,          # beat grid runs this far ahead to hide capture + LAN latency
     "room": [],                   # device IPs left -> right; empty = lamp, ceiling, lamp
     "lamp_segments": 15, "lamp_bottom_first": True, "lamp_hz": 12,
     "ceiling_pixels": 12, "stream_hz": 30,
@@ -359,12 +413,12 @@ def frac(x):
 GREEN_HUE = (math.radians(112), math.radians(188))     # OKLab hue: yellow-green .. teal
 
 
-def greenify(lab, lmin=0.55, lmax=0.80, cmin=0.17):
+def greenify(lab, lmin=0.55, lmax=0.80, cmin=0.17, hue=None):
     """Any scene color -> the nearest green: hue clamped into lime..teal, never gray or dim.
     Mossy/olive terrain stays mossy, water stays teal, brown earth becomes yellow-green."""
     L, a, b = lab
     c, h = math.hypot(a, b), math.atan2(b, a) % (2 * math.pi)
-    lo, hi = GREEN_HUE
+    lo, hi = hue or GREEN_HUE
     if not lo <= h <= hi:
         dlo = min(abs(h - lo), 2 * math.pi - abs(h - lo))
         dhi = min(abs(h - hi), 2 * math.pi - abs(h - hi))
@@ -1126,6 +1180,7 @@ class Bridge:
 
     def __init__(self):
         self.where = None           # (x, y, pitch)
+        self.ext = None             # row 2 of the strip, if the addon draws one
         self.last_seen = float("-inf")
         self.seq = None
         self.last_scan = 0.0
@@ -1150,6 +1205,17 @@ class Bridge:
                 return None
             vals.append((c[0] > 128) | (c[1] > 128) << 1 | (c[2] > 128) << 2)
         return vals[1:7] if vals[0] == 5 and vals[7] == 6 else None
+
+    def _read2(self, f, x, y, p):
+        """Row 2 (newer CouchLights): yellow | swim/indoors/hidden | pet/taxi | target class |
+        target health | power | version | yellow. None with an older addon."""
+        vals = []
+        for k in range(8):
+            c = self._px(f, x + k * p + p // 2, y + p)
+            if c is None:
+                return None
+            vals.append((c[0] > 128) | (c[1] > 128) << 1 | (c[2] > 128) << 2)
+        return vals[1:7] if vals[0] == 3 and vals[7] == 3 else None
 
     def _scan(self, f):
         w, h = f[0], f[1]
@@ -1178,6 +1244,7 @@ class Bridge:
         if vals is None:
             return None
         self.last_seen = now
+        self.ext = self._read2(f, *self.where)
         return vals
 
     def live(self, now):
@@ -1475,6 +1542,292 @@ class LogState:
 
 
 # ---- the show --------------------------------------------------------------------------
+# ---- music: listen to what the room is hearing ------------------------------------------
+class Music:
+    """Taps the music (PipeWire monitor of the music sink, via `parec`) and turns it into
+    features for the show: loudness, a 15-band spectrum (bass at the bottom of the lamps),
+    kick events, tempo and a beat phase.
+
+    Built to be a good neighbour: no threads (pump() reads what has arrived, never blocks,
+    at most one small FFT per 32 ms), numpy is imported only while music plays, the capture is
+    one 16 kHz mono stream, and if it dies it restarts with backoff. With no music playing
+    pump() returns None and the show behaves exactly as it did before."""
+    RATE, HOP, WIN, NB = 16000, 512, 1024, 15
+    FPS = RATE / HOP                      # analysis frames per second (31.25)
+    MIN_KICK_GAP = 0.40                   # s: at most 2.5 pulses/s whatever the song does
+    LOUD = 0.004                          # rms (full scale = 1) that counts as "music is playing"
+
+    def __init__(self, conf):
+        self.conf = conf
+        self.np = None
+        self.proc, self.fd, self.rem = None, None, b""
+        self.source, self.mixed, self.error = None, False, ""
+        self.retry_at, self.fails, self.last_data = 0.0, 0, 0.0
+        self.last_loud, self.t_up = -1e9, 0.0
+        self.feat = None
+        self.cpu = 0.0                    # mean analysis time per frame, ms (shown by `music test`)
+
+    # -- capture ---------------------------------------------------------------------
+    def _pick_source(self):
+        src = self.conf.get("music_source", "auto")
+        if src not in ("", "auto"):
+            return src
+        def run(*cmd):
+            try:
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=3).stdout
+            except (OSError, subprocess.SubprocessError):
+                return ""
+        names = [ln.split("\t")[1] for ln in run("pactl", "list", "short", "sources").splitlines()
+                 if "\t" in ln]
+        if "wow_music_eq.monitor" in names:      # the music alone: no spell sounds, no voice chat
+            self.mixed = False
+            return "wow_music_eq.monitor"
+        sink = run("pactl", "get-default-sink").strip()
+        self.mixed = True                       # everything the speakers play
+        return sink + ".monitor" if sink else None
+
+    def _fail(self, why):
+        self.error = why
+        self.fails += 1
+        self.retry_at = time.time() + min(60.0, 3.0 * 2 ** min(self.fails, 5))
+
+    def start(self):
+        if self.proc or time.time() < self.retry_at:
+            return
+        if self.np is None:
+            try:
+                import numpy
+            except ImportError:
+                self.retry_at = float("inf")
+                self.error = "numpy missing"
+                return
+            self.np = numpy
+            self._build()
+        src = self._pick_source()
+        if not src:
+            return self._fail("no audio source")
+        try:
+            self.proc = subprocess.Popen(
+                ["parec", "-d", src, "--format=float32le", f"--rate={self.RATE}", "--channels=1",
+                 "--latency-msec=30", "--client-name=govee-wow", "--stream-name=music-lights"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+        except OSError as e:
+            return self._fail(f"parec: {e}")
+        self.fd = self.proc.stdout.fileno()
+        os.set_blocking(self.fd, False)
+        self.source, self.rem = src, b""
+        self.last_data = self.t_up = time.time()
+        self._reset()
+        note(f"music: listening to {src}{' (everything the speakers play)' if self.mixed else ''}")
+
+    def stop(self):
+        if self.proc:
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+            except (OSError, subprocess.SubprocessError):
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
+            self.proc = None
+        self.feat = None
+
+    # -- analysis state ---------------------------------------------------------------
+    def _build(self):
+        np = self.np
+        self.win = np.hanning(self.WIN).astype(np.float32)
+        df = self.RATE / self.WIN
+        edges = np.geomspace(40.0, 7500.0, self.NB + 1)
+        self.slices = [(int(edges[i] // df), max(int(edges[i] // df) + 1, int(math.ceil(edges[i + 1] / df))))
+                       for i in range(self.NB)]
+
+    def _reset(self):
+        np = self.np
+        self.buf = np.zeros(0, dtype=np.float32)
+        self.prev_lm = None
+        self.peak = np.full(self.NB, 0.05)
+        self.spec = np.zeros(self.NB)
+        self.e_peak, self.energy = 0.02, 0.0
+        self.env, self.kf = [], []
+        self.frames = 0
+        self.bpm, self.conf_t, self.cand, self.cand_n = 0.0, 0.0, 0.0, 0
+        self.t_ref, self.last_kick, self.last_match = None, -1e9, -1e9
+        self.kick_now = 0.0
+        self.cpu_n, self.cpu = 0, 0.0
+
+    # -- per frame -------------------------------------------------------------------
+    def _frame(self, x, t):
+        np = self.np
+        dt = self.HOP / self.RATE
+        rms = float(np.sqrt(np.mean(x * x)))
+        if rms > self.LOUD:
+            self.last_loud = t
+        mag = np.abs(np.fft.rfft(x * self.win))
+        # spectrum: every band normalised by its own slowly decaying peak, so a quiet song and
+        # a loud one (the controller changes Spotify's volume) fill the lamps the same way
+        raw = np.array([mag[a:b].max() for a, b in self.slices])
+        self.peak = np.maximum(raw, self.peak * 0.5 ** (dt / 8.0))
+        lvl = np.clip((raw / np.maximum(self.peak, 0.05) - 0.2) / 0.8, 0.0, 1.0) ** 1.4
+        up = 1 - math.exp(-dt / 0.05)
+        down = 1 - math.exp(-dt / 0.28)
+        self.spec += (lvl - self.spec) * np.where(lvl > self.spec, up, down)
+        self.e_peak = max(rms, self.e_peak * 0.5 ** (dt / 8.0), 0.01)
+        self.energy += (min(1.0, rms / self.e_peak) - self.energy) * (1 - math.exp(-dt / 0.6))
+        # onset strength: positive change of the log spectrum (bass-only copy for the kick)
+        lm = np.log1p(mag[1:192] * 20.0)
+        if self.prev_lm is not None:
+            d = np.maximum(lm - self.prev_lm, 0.0)
+            flux, kflux = float(d.sum()), float(d[:10].sum())
+        else:
+            flux = kflux = 0.0
+        self.prev_lm = lm
+        self.env.append(kflux + 0.25 * flux)           # tempo follows the bass first: hi-hats repeat
+                                                        # as regularly as the beat and fool the lag search
+        self.kf.append(kflux)
+        if len(self.env) > 256:
+            del self.env[0]
+        if len(self.kf) > 48:
+            del self.kf[0]
+        self.frames += 1
+        self.kick_now = 0.0
+        if rms > self.LOUD and len(self.kf) >= 24:
+            k = np.array(self.kf[:-1])
+            thr = max(k.mean() + 1.5 * k.std(), 0.4 * k.max(), 0.35)
+            if (kflux > thr and kflux > 1.15 * self.kf[-2] and t - self.last_kick > self.MIN_KICK_GAP):
+                self.last_kick = t
+                self.kick_now = max(0.35, min(1.0, 0.5 + (kflux - thr) / max(thr, 0.35)))
+                self._on_kick(t, self.kick_now)
+        if self.frames % 32 == 0:
+            self._tempo(t)
+
+    def _tempo(self, t):
+        np = self.np
+        if len(self.env) < 128 or t - self.last_loud > 2.0 or self.energy < 0.15:   # fading / quiet: keep the old tempo
+            self.conf_t *= 0.7
+            return
+        x = np.array(self.env, dtype=np.float64)
+        x -= x.mean()
+        for _ in range(2):                         # soften the peaks: a beat that falls between two
+            x = np.convolve(x, [0.25, 0.5, 0.25], "same")    # analysis frames must not lose to one that doesn't
+        ac = np.correlate(x, x, "full")[len(x) - 1:]
+        if ac[0] <= 1e-9:
+            return
+        ac = ac / ac[0]
+        idx = np.arange(len(ac))
+        def at(v):
+            return float(np.interp(v, idx, ac)) if v < len(ac) - 1 else 0.0
+        def pk(v):                                 # tolerant lookup: best of +-0.8 frame
+            return max(at(v - 0.8), at(v), at(v + 0.8))
+        best, best_s = 11.0, -1.0
+        for lag in np.arange(11.0, 27.01, 0.25):   # 170 .. 70 BPM (faster songs fold to half)
+            s = pk(lag) + 0.5 * pk(2 * lag) + 0.25 * pk(4 * lag)
+            bpm = 60.0 * self.FPS / lag
+            s *= 0.5 + 0.5 * math.exp(-0.5 * (math.log2(bpm / 112.0) / 0.5) ** 2)
+            if s > best_s:
+                best, best_s = float(lag), s
+        fine, fine_s = best, -1.0
+        for lag in np.arange(best - 0.3, best + 0.301, 0.05):      # fine search around the winner
+            sc = pk(lag) + 0.5 * pk(2 * lag) + 0.25 * pk(4 * lag)
+            if sc > fine_s:
+                fine, fine_s = float(lag), sc
+        lag = best = fine
+        bpm = 60.0 * self.FPS / lag
+        conf = max(0.0, min(1.0, (pk(best) - 0.10) / 0.35))
+        self.conf_t += (conf - self.conf_t) * 0.5
+        if self.bpm == 0.0 or abs(bpm - self.bpm) / self.bpm < 0.04:
+            self.bpm = bpm if self.bpm == 0.0 else self.bpm + (bpm - self.bpm) * 0.3
+            self.cand_n = 0
+        elif abs(bpm - self.cand) / max(self.cand, 1.0) < 0.04:    # a different tempo: believe
+            self.cand_n += 1                                        # it only when it repeats
+            if self.cand_n >= 2:
+                self.bpm, self.cand_n = bpm, 0
+        else:
+            self.cand, self.cand_n = bpm, 1
+
+    def _on_kick(self, t, strength):
+        if not self.bpm:
+            return
+        period = 60.0 / self.bpm
+        if self.t_ref is None or t - self.last_match > 4.0:
+            self.t_ref, self.last_match = t, t                       # (re)seed the beat grid
+            return
+        err = ((t - self.t_ref) / period + 0.5) % 1.0 - 0.5          # beats off the grid
+        if abs(err) < 0.22:                                          # on the grid: nudge it
+            self.t_ref += err * period * (0.25 if strength > 0.6 else 0.1)
+            self.last_match = t
+
+    # -- public --------------------------------------------------------------------------
+    def pump(self, now):
+        """Feed whatever audio has arrived; returns the latest features, or None when there is
+        no music (silence, paused, no source, disabled)."""
+        if not self.conf.get("music", True):
+            if self.proc:
+                self.stop()
+            return None
+        if not self.proc:
+            self.start()
+            return None
+        try:
+            data = os.read(self.fd, 1 << 16)
+        except BlockingIOError:
+            data = None
+        except OSError:
+            data = b""
+        if data == b"" or self.proc.poll() is not None:
+            self.stop()
+            self._fail("capture ended")
+            return None
+        if data:
+            self.last_data = now
+            data = self.rem + data
+            n = len(data) // 4 * 4
+            self.rem = data[n:]
+            if n:
+                self._feed(self.np.frombuffer(data[:n], dtype=self.np.float32), now)
+            if now - self.t_up > 10:
+                self.fails = 0
+        elif now - self.last_data > 3.0:                # alive but silent for good: restart it
+            self.stop()
+            self._fail("capture stalled")
+            return None
+        return self.feat
+
+    def _feed(self, s, now):
+        np = self.np
+        self.buf = np.concatenate((self.buf, s))
+        if len(self.buf) > 8 * self.WIN:                # fell behind: drop the oldest, never lag
+            self.buf = self.buf[-2 * self.WIN:]
+        t0 = time.perf_counter()
+        n = 0
+        kick = 0.0
+        while len(self.buf) >= self.WIN:
+            t = now - (len(self.buf) - self.WIN) / self.RATE
+            self._frame(self.buf[:self.WIN], t)
+            kick = max(kick, self.kick_now)
+            self.buf = self.buf[self.HOP:]
+            n += 1
+        if n:
+            ms = (time.perf_counter() - t0) * 1000 / n
+            self.cpu = ms if not self.cpu else self.cpu * 0.95 + ms * 0.05
+        active = now - self.last_loud < 2.0
+        lead = self.conf.get("music_lead_ms", 40) / 1000.0
+        beat, lock = 0.0, False
+        if self.t_ref is not None and self.bpm:
+            period = 60.0 / self.bpm
+            beat = ((now + lead - self.t_ref) / period) % 1.0
+            lock = self.conf_t >= 0.45 and now - self.last_match < 3.0
+        self.feat = {"active": active, "energy": self.energy, "spec": self.spec.tolist(),
+                     "kick": kick, "bpm": self.bpm, "conf": self.conf_t, "lock": lock,
+                     "beat": beat, "mixed": self.mixed}
+
+    def status(self):
+        f = self.feat
+        if not f or not f["active"]:
+            return ""
+        return f"{f['bpm']:.0f} bpm" + (" locked" if f["lock"] else "")
+
+
 class FX:
     __slots__ = ("kind", "t0", "dur", "col", "k", "data")
 
@@ -1500,17 +1853,28 @@ class Show:
         self.flashes = []
         self.lum_avg = 0.3
         self.hb_phase = 0.0
-        self.state = {"combat": False, "boss": False, "dead": False, "mounted": False,
+        self.target_hp = None                 # 0-1 while fighting something, else None
+        self.pet_dead = False
+        self.hush = 1.0                       # feign death / stealth: the room holds its breath
+        self.state = {"combat": False, "boss": False, "dead": False, "ghost": False,
+                      "swimming": False, "indoors": False, "hidden": False, "mounted": False,
                       "resting": False, "instance": False}
         self.apply_style(conf, style_name(conf))
         self.mt = 0.0                         # motion clock (runs slower in calm styles)
         self.prev = None                      # last output, for the brightness slew limit
+        self.mf, self.mg = None, 0.0          # music features now / how much the music may move things
+        self.ke, self.kes, self.last_pulse = 0.0, 0.0, -1e9
+        self.m_spec, self.m_energy = [0.0] * Music.NB, 0.0
+        self.music_lock, self.music_bpm, self.music_beat = False, 120.0, 0.0
 
     def apply_style(self, conf, name):
         """Switch style live (the hour schedule): daylight swaps the whole color vocabulary."""
         self.conf, self.st = conf, STYLES[name]
+        self.mix = MUSIC_MIX.get(name, (0.0, 0.0, 0.0))
         self.soft_until = None                # style change: crossfade instead of a jump
-        cols = {**COLORS, **(DAY_COLORS if self.st.get("green") else {})}
+        cols = {**COLORS, **(DAY_COLORS if self.st.get("green") else {}),
+                **(NIGHT_COLORS if self.st.get("night") else {})}
+        self.sun_t = -1e9                     # sun <-> moon: pick the new tint right away
         self.c = {k: hexrgb(v) for k, v in cols.items()}
 
     # -- inputs --
@@ -1537,7 +1901,7 @@ class Show:
             self.scene_lab = lab if self.scene_lab is None else mix(self.scene_lab, lab, 0.08)
             self.pal = self.base_pal.tinted(self.scene_lab, self.conf["screen_tint"])
         if (self.conf["screen_flashes"] and self.st["screen_flashes"] and game_visible and lum - self.lum_avg > 0.2
-                and self.mode != "dead"):
+                and self.mode not in ("dead", "ghost")):
             self.flash(now, self.c["flash"], 0.7)
         self.lum_avg += (lum - self.lum_avg) * 0.1
 
@@ -1545,18 +1909,65 @@ class Show:
         old = dict(self.state)
         self.state.update(st)
         s = self.state
-        mode = ("dead" if s["dead"] else "boss" if s["boss"] else "combat" if s["combat"]
-                else "cruise" if s["mounted"] else "lounge" if s["resting"] else "explore")
+        mode = ("ghost" if s["dead"] and s["ghost"] else "dead" if s["dead"]
+                else "boss" if s["boss"] else "combat" if s["combat"]
+                else "cruise" if s["mounted"] else "swim" if s["swimming"]
+                else "lounge" if s["resting"] else "explore")
         if mode != self.mode:
+            was = self.mode
             self.prev_mode, self.mode, self.mode_t = self.mode, mode, now
+            if self.prev is not None and not getattr(self, "quiet", False):
+                note(f"game: {was} -> {mode}")
+            if was in ("dead", "ghost") and mode not in ("dead", "ghost"):
+                self.cue("revive", now)                           # back to life: green dawn
+            elif mode == "dead":
+                self.cue("death", now)                            # the light sinks to the floor
+                return
+            elif mode == "ghost":
+                return
             if mode == "combat" and not old["combat"]:
                 self.cue("wipe", now, col=self.c["red"])          # the drop
                 self.flash(now, self.c["hotpink"], 0.8)
             elif mode == "boss":
                 self.cue("wipe", now, col=self.c["purple"])
                 self.flash(now, self.c["flash"], 1.0)
-            elif mode == "dead":
-                self.cue("wipe", now, col=self.c["deepblue"], k=0.6)
+
+    # Cues that own the moment: the music steps back while they play.
+    LOUD_FX = {"firework", "ascend", "finale", "power", "death", "revive", "harvest", "omen",
+               "hurt", "strike", "shimmer"}
+
+    def set_music(self, f, now, dt):
+        """Music features (Music.pump) -> the layer state. Priorities: no music / dead / ghost
+        = off; hidden = half; fighting = 70% (the combat program already pulses, here the music
+        only locks its tempo); a game cue playing = 30%. Ducks fast, comes back slowly."""
+        self.mf = f if (f and f["active"]) else None
+        tgt = 1.0 if self.mf else 0.0
+        if self.mode in ("dead", "ghost"):
+            tgt = 0.0
+        elif self.state["hidden"]:
+            tgt *= 0.5
+        elif self.mode in ("combat", "boss"):
+            tgt *= 0.7
+        elif any(x.kind in self.LOUD_FX and now - x.t0 < x.dur for x in self.fx):
+            tgt *= 0.3
+        self.mg += (tgt - self.mg) * (1 - math.exp(-dt / (0.15 if tgt < self.mg else 1.2)))
+        self.ke *= math.exp(-dt / 0.30)
+        if self.mf:
+            if self.mf["kick"] > 0 and self.mg > 0.05:
+                self.ke = max(self.ke, self.mf["kick"])
+            self.m_spec, self.m_energy = self.mf["spec"], self.mf["energy"]
+        self.kes += (self.ke - self.kes) * (1 - math.exp(-dt / 0.07))      # pulses swell, never snap
+        f = self.mf
+        self.music_lock = bool(f and f["lock"] and self.mg > 0.3 and 70 <= f["bpm"] <= 165
+                               and self.mode in ("combat", "boss"))
+        if self.music_lock:
+            self.music_bpm, self.music_beat = f["bpm"], f["beat"]
+
+    def set_pet(self, dead, now):
+        if dead and not self.pet_dead and self.prev is not None:
+            note("game: pet died")
+            self.cue("death", now, k=0.55)                        # a smaller fall, lamps only
+        self.pet_dead = dead
 
     def event(self, code, detail, now):
         c = self.c
@@ -1564,13 +1975,17 @@ class Show:
             self.energy = min(1.0, self.energy + 0.18)
             if detail == 1:
                 self.cue("power", now)
+            elif detail == 2:                           # skinning / mining / herbs / fishing
+                self.cue("harvest", now)
+            elif detail == 3:                           # melee strike: ember kicks up the lamps
+                self.cue("strike", now, col=c["amber"])
             else:
                 col = self.pal.at(random.random()) if self.mode in ("explore", "lounge", "cruise") \
                     else (c["hotpink"] if random.random() < 0.6 else c["magenta"])
                 self.cue("ring", now, col=col)
         elif code == 2:                                 # kill
             self.energy = min(1.0, self.energy + 0.3)
-            self.cue("firework", now)
+            self.cue("firework" if self.st["flash"] else "ascend", now, col=c["gold"])
         elif code == 3:                                 # hit taken
             self.energy = min(1.0, self.energy + 0.1)
             self.cue("hurt", now, k=0.5 + detail / 10)
@@ -1579,14 +1994,26 @@ class Show:
         elif code == 5:                                 # level up
             self.cue("finale", now)
         elif code == 6:                                 # quest / achievement / boss kill
-            self.cue("finale" if detail == 7 else "shimmer", now)
+            if detail == 7:
+                self.cue("finale", now)
+            elif detail == 6:                           # someone whispered you
+                self.cue("ping", now, col=c["violet"])
+            else:
+                self.cue("shimmer", now)
+                if 3 <= detail <= 5:                    # good loot, by item quality
+                    self.cue("omen", now, col=(c["flash"], c["blue"], c["purple"])[detail - 3])
         elif code == 7:                                 # new hostile target
-            self.cue("blip", now)
+            if detail >= 1:                             # elite gold, rare violet, world boss red
+                self.cue("omen", now, col=(c["gold"], c["purple"], c["red"])[min(detail, 3) - 1])
+            elif not self.st.get("night"):
+                self.cue("blip", now)
 
     def cue(self, kind, now, col=None, k=1.0):
         c = self.c
         dur = {"ring": 0.55, "power": 1.5, "firework": 1.6, "hurt": 0.6, "heal": 0.9,
-               "finale": 5.0, "shimmer": 1.4, "blip": 0.25, "wipe": 0.9}[kind]
+               "finale": 5.0, "shimmer": 1.4, "blip": 0.25, "wipe": 0.9, "harvest": 1.8,
+               "strike": 0.7, "ascend": 1.6, "death": 2.2, "revive": 2.4, "omen": 1.8,
+               "ping": 1.6}[kind]
         data = None
         if kind in ("firework", "finale", "shimmer"):
             n = {"firework": 18, "finale": 70, "shimmer": 14}[kind]
@@ -1618,12 +2045,16 @@ class Show:
     def program(self, mode, p, t, beat, bar):
         """Base look of one pixel for one program: (r, g, b) 0-1."""
         lvl = self.conf["program_level"][mode]
-        if mode != "dead" and self.st.get("lift"):
+        if mode not in ("dead", "ghost") and self.st.get("lift"):
             lvl = min(max(lvl, self.st.get("lift_max", 1.0)), lvl * self.st["lift"])
         c = self.c
-        if self.st.get("green") and mode in ("explore", "lounge", "cruise"):
+        if mode in ("explore", "lounge", "swim", "cruise") and self.state["indoors"]:
+            lvl *= 0.75                               # caves, buildings: the world dims
+        if mode in ("combat", "dead", "ghost"):       # the same story in every style
+            return self.night_program(mode, p, t, lvl, beat)
+        if self.st.get("green") and mode in ("explore", "lounge", "cruise", "swim"):
             return self.day_program(mode, p, t, lvl)
-        if mode in ("explore", "lounge"):
+        if mode in ("explore", "lounge", "swim"):
             slow = 0.6 if mode == "lounge" else 1.0
             col = self.pal.at(p.u * 0.45 + p.h * 0.3 + t * slow / 40)
             k = lvl * (0.8 + 0.2 * math.sin(2 * math.pi * (bar / 2 + p.u + p.h * 0.5)))
@@ -1669,7 +2100,33 @@ class Show:
                                                      * (1 - math.exp(-beat * 5))))
         # dead: deep blue, a slow flatline pulse
         g = math.exp(-((frac(t / 4) - 0.1) / 0.06) ** 2)
-        return scale(c["deepblue"], lvl * (0.8 + 1.2 * g))
+        return scale(c["deepblue"], lvl * (0.8 + 1.2 * g * min(1.0, self.st["pulse"] / 0.7)))
+
+    def night_program(self, mode, p, t, lvl, beat):
+        """The fight, the corpse and the spirit world (every style, in its own colors)."""
+        c = self.c
+        if mode == "combat":      # the fight's heat climbs the lamps out of the forest floor
+            pd = self.st["pulse"]
+            breath = 1 - 0.3 * pd + 0.3 * pd * math.exp(-beat * 4)
+            ember = mix(c["red"], c["amber"], 0.5 + 0.5 * math.sin(t * 0.35 + p.h * 2.5 + p.u * 3))
+            if self.target_hp is not None:            # the kill is near: the embers turn to gold
+                ember = mix(ember, c["gold"], 0.7 * (1 - self.target_hp) ** 1.5)
+            if p.lamp:
+                fill = 0.3 + 0.6 * self.energy
+                heat = 1 - ease((p.h - fill) / 0.3 + 0.5)
+                return scale(mix(c["leaf"], ember, heat), lvl * (0.55 + 0.45 * heat) * breath)
+            k = 0.75 + 0.25 * math.sin(2 * math.pi * (p.ring - t * 0.04))
+            return scale(mix(c["crimson"], ember, 0.35 + 0.4 * self.energy), lvl * 0.7 * k * breath)
+        if mode == "dead":        # corpse: the room is out, last embers glow at the floor
+            if not p.lamp:
+                return (0.0, 0.0, 0.0)
+            g = math.exp(-p.h / 0.16) * (0.75 + 0.25 * math.sin(t * 0.6 + p.u * 2))
+            return scale(c["hurt"], min(1.0, lvl * 2.2) * g)
+        # ghost: indigo mist drifting slowly up the lamps, the ceiling barely there
+        if not p.lamp:
+            return scale(c["deepblue"], lvl * 0.45)
+        g = math.sin(math.pi * (p.h * 0.8 - t * 0.05 + p.u * 0.3)) ** 2
+        return scale(mix(c["deepblue"], c["violet"], g), lvl * (0.35 + 0.65 * g))
 
     def terrain(self, p, base):
         """The game world behind / above you at this pixel, pulled into the green family."""
@@ -1678,14 +2135,22 @@ class Show:
         z = zl[p.i] if zl and p.i < len(zl) else None
         if z is None:                         # no picture: palette gradient ground -> canopy
             return base
-        return mix_hue(base, greenify(z), self.conf.get("terrain_tint", 0.55))
+        hue = NIGHT_HUE if self.st.get("night") else None
+        return mix_hue(base, greenify(z, hue=hue), self.conf.get("terrain_tint", 0.55))
 
     def day_program(self, mode, p, t, lvl):
         """Daylight: ground rising into foliage on the lamps behind you, sky / canopy overhead,
         wind waves crossing the room left -> right, sun dapples drifting over the ceiling."""
-        slow = 0.6 if mode == "lounge" else 1.0
+        slow = 0.6 if mode == "lounge" else 0.7 if mode == "swim" else 1.0
         base = to_oklab(self.pal.at(p.u * 0.35 + p.h * 0.3 + t * slow / 45))
         lab = mix_hue(self.terrain(p, base), self.sun, 0.16)
+        night = self.st.get("night")
+        if mode == "swim":                    # in the water: the whole room turns to deep water
+            lab = greenify(lab, lmin=0.0, lmax=1.0, cmin=0.12,
+                           hue=NIGHT_WATER_HUE if night else WATER_HUE)
+        elif night:                           # evening: every hue pulled into forest green
+            lab = greenify(lab, lmin=0.0, lmax=1.0, cmin=0.0, hue=NIGHT_HUE)
+        spark = self.st.get("sparkle", 1.0)   # dapples / fireflies: fainter in the evening
         if p.lamp:                            # deeper at the floor, brighter into the leaves
             k = 0.72 + 0.28 * ease(p.h)
             gust = 0.6 + 0.4 * math.sin(t * 0.07 * slow + 1.3)
@@ -1704,19 +2169,21 @@ class Show:
                 g = math.exp(-(((frac(p.ring - t * 0.8) - 0.5) * 4) ** 2))
             return scale(out, 0.45 + 0.75 * g)
         sun = from_oklab(mix_lch(to_oklab(self.c["sun"]), self.sun, 0.3))
+        if mode == "swim":                    # no sun dapples or fireflies under water
+            return out
         if not p.lamp:                        # sun through the leaves, clouds come and go
             for d in range(3):
                 pos = frac(d / 3 + t * 0.012 * slow * (1 + 0.35 * d)
                            + 0.04 * math.sin(t * 0.23 + d * 1.7))
                 dist = min(abs(p.ring - pos), 1 - abs(p.ring - pos))
                 g = math.exp(-(dist / 0.08) ** 2) * (0.55 + 0.45 * math.sin(t * 0.05 + d * 2))
-                out = tuple(o + x * g * 0.45 for o, x in zip(out, sun))
+                out = tuple(o + x * g * 0.45 * spark for o, x in zip(out, sun))
         for d in range(self.conf["drones"] if mode == "explore" else 1):   # fireflies / pollen
             du = 0.5 + 0.55 * math.sin(t * (0.17 + 0.06 * d) * slow + d * 2.1)
             dh = 0.5 + 0.5 * math.sin(t * (0.29 + 0.05 * d) * slow + d * 1.3)
             g = math.exp(-((p.u - du) ** 2 + ((p.h - dh) * 0.8) ** 2) / 0.012)
             if g > 0.01:
-                out = tuple(o + x * g * 0.6 for o, x in zip(out, sun))
+                out = tuple(o + x * g * 0.6 * spark for o, x in zip(out, sun))
         return out
 
     def render(self, t, dt):
@@ -1724,12 +2191,16 @@ class Show:
         want = conf["bpm"][self.mode]
         if self.mode == "combat" and self.bpm_hint:
             want = self.bpm_hint
+        if self.music_lock:                   # fights and bosses move to the music's tempo
+            want = self.music_bpm
         self.bpm += (want - self.bpm) * min(1.0, dt * 1.5)
         sp = self.st["speed"]
         self.phase += dt * self.bpm / 60 * sp
         self.mt += dt * sp
         mt = self.mt
         beat, bar = frac(self.phase), self.phase / 4
+        if self.music_lock:
+            beat = self.music_beat
         self.energy *= math.exp(-dt / 2.5)
         if (self.st["boss_hits"] and self.mode == "boss" and int(self.phase) % 4 == 0
                 and beat < dt * self.bpm / 60 * sp):
@@ -1737,7 +2208,7 @@ class Show:
         xf = ease((t - self.mode_t) / 0.8)
         low = conf["low_health"]
         hb = 0.0
-        if self.hp < low and self.mode != "dead":
+        if self.hp < low and self.mode not in ("dead", "ghost"):
             rate = (70 + (low - self.hp) / low * 80) * (0.6 + 0.4 * self.st["heartbeat"])
             self.hb_phase += dt * rate / 60
             x = frac(self.hb_phase)
@@ -1747,13 +2218,22 @@ class Show:
         if self.soft_until is None:
             self.soft_until = t + 2.5 if self.prev is not None else t
         if self.st.get("green") and t - self.sun_t > 30:     # the sun moves across the day
-            self.sun, self.sun_t = sun_lab(), t
+            self.sun = to_oklab(self.c["sun"]) if self.st.get("night") else sun_lab()
+            self.sun_t = t
         elif self.sun is None:
             self.sun = sun_lab()
         night = time.localtime().tm_hour
         a, b = conf["night_from"], conf["night_to"]
         is_night = (night >= a or night < b) if a > b else a <= night < b
         master = conf["night_scale"] if is_night else 1.0
+        self.hush += ((0.3 if self.state["hidden"] else 1.0) - self.hush) * min(1.0, dt * 1.5)
+        master *= self.hush
+        mw = None
+        if self.mg > 0.01 and any(self.mix):
+            lv = max(0.0, min(1.5, float(conf.get("music_level", 1.0)))) * self.mg
+            wk, ws, ww = (min(0.8, w * lv) for w in self.mix)
+            sp, mean = self.m_spec, sum(self.m_spec) / len(self.m_spec)
+            mw = (wk, ws, ww, self.kes, self.m_energy, sp, mean, 1 + 0.5 * (wk + ws + ww))
         frame, out = {}, []
         for idx, p in enumerate(self.px):
             col = self.program(self.mode, p, mt, beat, bar)
@@ -1765,7 +2245,8 @@ class Show:
             for f in self.fx:
                 if t >= f.t0:
                     col = self.add_fx(f, p, idx, t - f.t0, col)
-            col = scale(vivid(fit(col), self.st.get("vivid", 0.0)), master)
+            col = scale(vivid(fit(col), self.st.get("vivid", 0.0)),
+                        master * (1.0 if p.lamp else self.st.get("ceiling", 1.0)))
             if self.st.get("warm"):
                 col = warm(col)
             slew = self.st["slew"]
@@ -1774,7 +2255,13 @@ class Show:
             if slew > 0 and self.prev is not None:      # hard brightness-change speed limit
                 lim = slew * dt
                 col = tuple(q + max(-lim, min(lim, x - q)) for x, q in zip(col, self.prev[idx]))
-            out.append(col)
+            out.append(col)                             # the show's own value is what slew remembers
+            if mw:                                      # the music layer: only ever dims, then
+                wk, ws, ww, ke, en, sp, mean, lift = mw  # makes up the average with a small lift
+                nb = len(sp)
+                band = sp[min(nb - 1, int((p.h if p.lamp else p.ring) * nb))]
+                lvl = band if p.lamp else 0.5 * (band + mean)
+                col = fit(scale(col, lift * (1 - (wk * (1 - ke) + ws * (1 - lvl) + ww * (1 - en)))))
             frame.setdefault(p.ip, []).append(col)
         self.prev = out
         return frame
@@ -1801,6 +2288,31 @@ class Show:
         elif f.kind == "heal":                        # blue shimmer rising
             g = f.k * 0.7 * math.exp(-((p.h - r * 1.2) / 0.15) ** 2) * (1 - r)
             fc = c["ice"]
+        elif f.kind == "harvest":                     # dark gold fills the lamps, then settles
+            fill = ease(r / 0.55) * 1.1
+            hold = 1 - ease((r - 0.7) / 0.3)
+            g = (ease((fill - p.h) / 0.2 + 0.5) if p.lamp else 0.35 * ease(r / 0.6)) * hold
+            fc = mix(c["amber"], c["gold"], p.h)
+        elif f.kind == "strike":                      # your melee hit: ember ripple from the floor
+            g = math.exp(-((p.h - r * 1.1) / 0.18) ** 2) * (1 - r) * 0.8 if p.lamp else 0.0
+        elif f.kind == "ascend":                      # kill: a gold band rises and leaves by the ceiling
+            front = r * 1.7
+            g = (math.exp(-((p.h - front) / 0.24) ** 2) if p.lamp
+                 else 0.8 * math.exp(-((1.35 - front) / 0.28) ** 2))
+        elif f.kind == "death":                       # red sinks from the ceiling to the floor
+            front = 1.2 - r * 1.3
+            g = (math.exp(-((p.h - front) / 0.22) ** 2) if p.lamp
+                 else max(0.0, 1 - r * 3) * 0.6 * (f.k >= 1)) * (1 - 0.5 * r) * f.k
+            fc = c["hurt"]
+        elif f.kind == "omen":                        # something special: slow swell from above
+            g = math.sin(math.pi * r) ** 2 * (0.3 + 0.6 * p.h if p.lamp else 1.0)
+        elif f.kind == "ping":                        # two soft pulses on the ceiling
+            g = 0.0 if p.lamp else 0.8 * math.sin(2 * math.pi * r) ** 2
+        elif f.kind == "revive":                      # green dawn climbs from the floor to the ceiling
+            front = r * 1.8
+            g = 0.9 * (math.exp(-((p.h - front) / 0.32) ** 2) if p.lamp
+                       else math.exp(-((1.4 - front) / 0.32) ** 2))
+            fc = c["flash"]
         elif f.kind == "blip":
             g = 0.0 if p.lamp else 0.7 * (1 - r)
             fc = c["hotpink"]
@@ -1879,10 +2391,46 @@ def draw(devs, header):
     sys.stdout.flush()
 
 
-def demo_frames(conf, secs=75.0, fps=30, seed=7):
+def fake_music(t, bpm=124.0):
+    """Stand-in for Music.pump in the preview / safety check: a steady 4-on-the-floor song."""
+    beat = (t * bpm / 60) % 1.0
+    f = {"active": True, "energy": 0.75 + 0.2 * math.sin(t * 0.4), "kick": 0.0,
+         "spec": [max(0.0, min(1.0, 0.55 + 0.45 * math.sin(t * (1.3 + 0.37 * i) + i))) for i in range(Music.NB)],
+         "bpm": bpm, "conf": 1.0, "lock": True, "beat": beat, "mixed": False}
+    if beat < bpm / 60 / 30:                    # the frame in which each beat starts
+        f["kick"] = 1.0
+    return f
+
+
+def recruit_type():
+    """CouchUI Recruit targeted a player: type "/ginvite" + Enter, then Esc to close the chat.
+    WoW Forever blocks guild invites from macros and addons, but not typed ones; /ginvite with
+    no name invites the target. Real key presses (xdotool), in a thread: lights keep running."""
+    import threading
+
+    def go():
+        try:
+            wid = subprocess.run(["xdotool", "search", "--name", "^World of Warcraft$"],
+                                 capture_output=True, text=True, timeout=3).stdout.split()
+            if not wid:
+                return
+            w = ["--window", wid[0]]
+            time.sleep(0.15)
+            for cmd in (["key", *w, "Return"], ["type", *w, "--delay", "30", "/ginvite"],
+                        ["key", *w, "Return"], ["key", *w, "Escape"]):
+                subprocess.run(["xdotool", *cmd], timeout=5)
+                time.sleep(0.25)
+            print("recruit: typed /ginvite", flush=True)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    threading.Thread(target=go, daemon=True).start()
+
+
+def demo_frames(conf, secs=75.0, fps=30, seed=7, music=False):
     """Yields (t, label, show, frame) for the scripted demo, without any lights."""
     random.seed(seed)
     show = Show(conf, build_room(FAKE_ROOM, conf))
+    show.quiet = True
     show.set_palette(palette_for(conf, None), 0.0)
     if show.st.get("green"):
         show.zl = {k: list(v) for k, v in FAKE_ZONES.items()}
@@ -1906,6 +2454,8 @@ def demo_frames(conf, secs=75.0, fps=30, seed=7):
             elif act[0] == "zone":
                 show.set_palette(palette_for(conf, act[1]), t)
                 label = f"zone: {act[1]} -> {show.pal_name}"
+        if music:
+            show.set_music(fake_music(t), t, dt)
         yield t, label, show, show.render(t, dt)
         t += dt
 
@@ -1954,13 +2504,13 @@ def luminance(c):
     return 0.2126 * _lin(c[0]) + 0.7152 * _lin(c[1]) + 0.0722 * _lin(c[2])
 
 
-def flash_report(conf, secs=75.0, fps=30):
+def flash_report(conf, secs=75.0, fps=30, music=False):
     """WCAG 2.3.1-style analysis per light: a flash = a pair of opposing luminance changes of
     >= 10% where the darker state is < 0.80; red flash = the same involving saturated red.
     Also reports the fastest brightness change (how 'punchy' it feels)."""
     series, peak, blue = {}, 0.0, 0.0
     dimmer = level_cap(conf)
-    for t, _l, show, frame in demo_frames(conf, secs, fps):
+    for t, _l, show, frame in demo_frames(conf, secs, fps, music=music):
         for k, (kind, cols) in enumerate(frame_devs(show, frame)):
             peak = max(peak, dimmer * max(max(c) for c in cols))
             blue = max(blue, max(c[2] for c in cols))
@@ -2006,6 +2556,15 @@ def check(conf):
         mark = "  <- now" if name == style_name(conf) else ""
         print(f"{name:10} {r['flash']:>10.1f} {r['red']:>14.1f} {r['jump']:>13.1f}/s "
               f"{cap:>4}% {r['peak']:>5.0f}% {r['blue'] * 100:>4.0f}%   {verdict}{mark}")
+    print("with music (a simulated 124 BPM song on top of the same demo):")
+    for name in STYLES:
+        sconf = {**conf, "style": name, "night_style": "", "schedule": []}
+        cap = level_cap(sconf)
+        r = flash_report(sconf, music=True)
+        ok = r["flash"] <= 3 and r["red"] <= 3 and r["peak"] <= cap + 1e-6
+        verdict = "calm" if r["flash"] <= 1 and r["jump"] <= 2 else "within guideline" if ok else "TOO FLASHY"
+        print(f"{name + '+music':10} {r['flash']:>10.1f} {r['red']:>14.1f} {r['jump']:>13.1f}/s "
+              f"{cap:>4}% {r['peak']:>5.0f}% {r['blue'] * 100:>4.0f}%   {verdict}")
     print("fastest change = share of full brightness per second (1.0/s = dark to full in 1 s)")
     print("cap = style brightness cap (govee-wow max); peak = brightest any light gets "
           "(% of its maximum, never above cap); blue = most blue in any color")
@@ -2065,6 +2624,7 @@ def session(conf, until=None, demo=False):
     if until:
         until += time.time() - t_begin            # the demo gets its full length
     screen, bridge = Screen(), Bridge()
+    music = Music(conf)
     # Capture starts only once the game window has been up capture_delay s (never during the
     # Battle.net launch / Play handoff), restarts silently if GNOME ends the stream (monitors
     # changed), and the portal backend gets one retry per session at most (it may need a dialog).
@@ -2172,6 +2732,9 @@ def session(conf, until=None, demo=False):
                         conf = live_conf
                         show.apply_style(conf, name)
                         note(f"style -> {name}, cap {level_cap(conf)}%")
+                    for k in ("music", "music_level", "music_lead_ms", "music_source"):
+                        conf[k] = live_conf[k]                  # `govee-wow music ...` applies live
+                    music.conf = conf
                     if level_cap(live_conf) != lights.target:   # schedule or `govee-wow max`
                         conf["max_level"] = live_conf.get("max_level", conf.get("max_level"))
                         conf["level"] = live_conf["level"]
@@ -2190,11 +2753,22 @@ def session(conf, until=None, demo=False):
                 if vals:
                     s1, s2, hp, code, detail, seq = vals
                     show.set_state(now, combat=bool(s1 & 1), boss=bool(s1 & 2),
-                                   dead=bool(s1 & 4), mounted=bool(s2 & 1),
+                                   dead=bool(s1 & 4), ghost=bool(s1 & 4) and bool(s2 & 1),
+                                   mounted=(bool(s2 & 1) and not s1 & 4)
+                                   or bool(bridge.ext and bridge.ext[1] & 4),
                                    resting=bool(s2 & 2), instance=bool(s2 & 4))
                     show.hp = (hp + 0.5) / 8 if hp < 7 else 1.0
+                    if bridge.ext:
+                        e1, e2, tclass, thp = bridge.ext[:4]
+                        show.set_state(now, swimming=bool(e1 & 1), indoors=bool(e1 & 2),
+                                       hidden=bool(e1 & 4))
+                        show.set_pet(bool(e2 & 2), now)
+                        show.target_hp = (thp + 0.5) / 8 if tclass and thp < 7 else None
                     if bridge.seq is not None and seq != bridge.seq and code:
-                        show.event(code, detail, now)
+                        if code == 1 and detail == 7:   # CouchUI Recruit: type the invite
+                            recruit_type()
+                        else:
+                            show.event(code, detail, now)
                     bridge.seq = seq
                     logst.queue.clear()
                     show.bpm_hint = None
@@ -2221,6 +2795,7 @@ def session(conf, until=None, demo=False):
                 if show.st.get("green"):
                     show.set_zones(zones(frame, conf["lamp_segments"], conf["ceiling_pixels"]),
                                    dt)
+            show.set_music(music.pump(now), now, dt)
             frame_now = show.render(now, dt)
             lights.show(frame_now, conf, now)
             if now - watch_check > 1.0:                # `govee-wow watch` open?
@@ -2241,7 +2816,8 @@ def session(conf, until=None, demo=False):
                 src += f" (lag-compensated {logst.delay:.1f}s)"
             text = (f"{show.mode} · {show.pal_name} · {len(lights.devices)} lights · {src}"
                     + (f" · screen: {screen.backend} {screen.connector or ''}".rstrip()
-                       if screen.sink else screen_note or " · screen waits for the WoW window"))
+                       if screen.sink else screen_note or " · screen waits for the WoW window")
+                    + (f" · music {music.status()}" if music.status() else ""))
             if text != status_text:
                 status_text = text
                 write_status(text)
@@ -2255,6 +2831,7 @@ def session(conf, until=None, demo=False):
             screen.stop()
         except Exception as e:                  # never let capture teardown skip the restore
             note(f"screen stop failed: {e}")
+        music.stop()
         try:
             lights.fade_out(0.8)
             end = time.time() + 0.8
@@ -2271,6 +2848,35 @@ def session(conf, until=None, demo=False):
 
 def _sigterm(_sig, _frm):
     raise SystemExit(0)          # runs the finally blocks: capture stopped, lights restored
+
+
+def music_test(conf, secs):
+    """Live readout of what the daemon hears (no lights touched): `govee-wow music test`."""
+    m = Music(conf)
+    blocks = " ▁▂▃▄▅▆▇█"
+    t_end, last, kicks, n = time.time() + secs, 0.0, 0, 0
+    try:
+        while time.time() < t_end:
+            now = time.time()
+            f = m.pump(now)
+            if f:
+                kicks += f["kick"] > 0
+            if now - last >= 0.25:
+                last = now
+                if f and f["active"]:
+                    bars = "".join(blocks[min(8, int(v * 8.99))] for v in f["spec"])
+                    print(f"{bars}  energy {f['energy']:.2f}  {f['bpm']:5.1f} bpm  conf {f['conf']:.2f}"
+                          f"  {'LOCK' if f['lock'] else '    '}  beat {f['beat']:.2f}  "
+                          f"{'●' * kicks:<3} cpu {m.cpu:.2f} ms", flush=True)
+                    n += 1
+                else:
+                    print(f"(no music)  source {m.source or '-'}  {m.error}", flush=True)
+                kicks = 0
+            time.sleep(0.03)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        m.stop()
 
 
 def daemon():
@@ -2308,6 +2914,16 @@ def main():
         watch()
     elif arg == "check":
         check(load_conf())
+    elif arg == "music" and len(sys.argv) > 2 and sys.argv[2] in ("on", "off"):
+        load_conf()
+        save_key("music", sys.argv[2] == "on")
+        print(f"music reactive lights: {sys.argv[2]} (a running show follows within 2 s)")
+    elif arg == "music" and len(sys.argv) > 3 and sys.argv[2] == "level":
+        load_conf()
+        save_key("music_level", max(0.0, min(1.5, float(sys.argv[3]))))
+        print(f"music level: {sys.argv[3]} (0 = ignore the music, 1 = default, 1.5 = livelier)")
+    elif arg == "music" and len(sys.argv) > 2 and sys.argv[2] == "test":
+        music_test(load_conf(), float(sys.argv[3]) if len(sys.argv) > 3 else 12.0)
     elif arg == "afterdark" and len(sys.argv) > 3 and sys.argv[2] == "level" \
             and sys.argv[3].isdigit() and 1 <= int(sys.argv[3]) <= 10:
         load_conf()
