@@ -16,7 +16,6 @@ Tests:
 """
 import os
 import importlib.util
-import json
 import random
 import shutil
 import subprocess
